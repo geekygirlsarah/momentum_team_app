@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}Room assignments — {{ event.name }}{% endblock %}
+
+{% block content %}
+<div class="container my-4">
+    <nav aria-label="Travel navigation" class="mb-3">
+        <a href="{% url 'travel:event_list' program.id %}" class="text-decoration-none">&larr; Back to Travel &amp; Competitions</a>
+    </nav>
+    <section class="card shadow-sm border-0 border-top border-3 border-primary rounded-3" aria-labelledby="room-assignments-title">
+        <div class="card-header bg-white p-3 p-md-4">
+            <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                <div>
+                    <p class="small text-uppercase text-muted fw-semibold mb-1">{{ event.name }}</p>
+                    <h1 class="h3 fw-bold mb-1" id="room-assignments-title">Room assignments</h1>
+                    <p class="text-muted mb-0">{{ event.start_date|date:"N j, Y" }}{% if event.end_date and event.end_date != event.start_date %} &ndash; {{ event.end_date|date:"N j, Y" }}{% endif %}</p>
+                </div>
+                <span class="badge text-bg-primary rounded-pill">{{ event.hotel_room_count }} hotel room{{ event.hotel_room_count|pluralize }}</span>
+            </div>
+        </div>
+        <div class="card-body p-3 p-md-4">
+            <p class="text-muted">Room numbers are created by setting the number of hotel rooms. Each room below shows everyone assigned to share it.</p>
+            {% if can_edit %}
+            <p class="small text-muted">Only Lead Mentors can edit this chart. Save a changed room count first; then choose from the saved room numbers for each traveler.</p>
+            <form method="post" action="{% url 'travel:room_assignments' program.id event.id %}">
+                {% csrf_token %}
+                {% if room_assignments_form.non_field_errors %}
+                <div class="alert alert-danger" role="alert">
+                    {% for error in room_assignments_form.non_field_errors %}<div>{{ error }}</div>{% endfor %}
+                </div>
+                {% endif %}
+                <div class="row g-3 align-items-end mb-3">
+                    <div class="col-sm-6 col-md-4">
+                        <label class="form-label" for="{{ room_assignments_form.room_count.id_for_label }}">{{ room_assignments_form.room_count.label }}</label>
+                        {{ room_assignments_form.room_count }}
+                        {% for error in room_assignments_form.room_count.errors %}<div class="small text-danger">{{ error }}</div>{% endfor %}
+                    </div>
+                </div>
+                {% if room_groups %}
+                <fieldset class="mb-3">
+                    <legend class="h5">Hotel room numbers</legend>
+                    <div class="row g-3">
+                        {% for room in room_groups %}
+                        <div class="col-sm-6 col-md-4">
+                            <label class="form-label" for="{{ room.hotel_room_input.id_for_label }}">{{ room.hotel_room_input.label }}</label>
+                            {{ room.hotel_room_input }}
+                            {% for error in room.hotel_room_input.errors %}<div class="small text-danger">{{ error }}</div>{% endfor %}
+                        </div>
+                        {% endfor %}
+                    </div>
+                </fieldset>
+                {% endif %}
+                {% if travelers %}
+                <h2 class="h5">Assign travelers to rooms</h2>
+                <div class="table-responsive" tabindex="0" role="region" aria-label="Editable trip room assignments">
+                    <table class="table table-sm table-striped align-middle">
+                        <caption class="visually-hidden">Assign travelers to hotel rooms for {{ event.name }}</caption>
+                        <thead class="table-light">
+                            <tr><th scope="col">Traveler</th><th scope="col">Role</th><th scope="col">Room</th></tr>
+                        </thead>
+                        <tbody>
+                        {% for traveler in travelers %}
+                            <tr>
+                                <th scope="row">{{ traveler.name }}</th>
+                                <td>{{ traveler.role_label }}</td>
+                                <td>
+                                    <label class="visually-hidden" for="{{ traveler.room_input.id_for_label }}">Room for {{ traveler.name }}</label>
+                                    {{ traveler.room_input }}
+                                    {% for error in traveler.room_input.errors %}<div class="small text-danger">{{ error }}</div>{% endfor %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+                <button class="btn btn-primary" type="submit">Save room count and assignments</button>
+            </form>
+            {% endif %}
+
+            <section class="mt-4" aria-labelledby="rooms-list-title">
+                <h2 class="h5" id="rooms-list-title">Room chart</h2>
+                {% for room in room_groups %}
+                <section class="border rounded p-3 mb-3" aria-labelledby="room-{{ room.room_number }}-title">
+                    <h3 class="h6 fw-semibold" id="room-{{ room.room_number }}-title">Room {{ room.room_number }}{% if room.hotel_room_label %} <span class="text-muted">— Hotel room {{ room.hotel_room_label }}</span>{% endif %}</h3>
+                    {% for traveler in room.travelers %}
+                    <div>{{ traveler.name }} <span class="text-muted">— {{ traveler.role_label }}</span></div>
+                    {% empty %}
+                    <p class="small text-muted mb-0">No travelers assigned to this room</p>
+                    {% endfor %}
+                </section>
+                {% empty %}
+                <p class="text-muted">No hotel rooms have been set up yet.</p>
+                {% endfor %}
+            </section>
+
+            {% if unassigned_travelers %}
+            <section aria-labelledby="unassigned-travelers-title">
+                <h2 class="h5" id="unassigned-travelers-title">Not assigned to a room</h2>
+                <ul class="mb-0">
+                    {% for traveler in unassigned_travelers %}
+                    <li>{{ traveler.name }} <span class="text-muted">— {{ traveler.role_label }}</span></li>
+                    {% endfor %}
+                </ul>
+            </section>
+            {% elif not travelers and not room_groups %}
+            <p class="text-muted">No current travelers are signed up for this trip.</p>
+            {% endif %}
+        </div>
+    </section>
+</div>
+{% endblock %}

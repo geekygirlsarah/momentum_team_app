@@ -56,6 +56,16 @@ class TravelEvent(models.Model):
         default=False,
         help_text="Mark local competitions that need a separate yes/no attendance response.",
     )
+    has_organized_travel = models.BooleanField(
+        default=True,
+        verbose_name="Organized travel",
+        help_text="The organization is arranging travel for this event.",
+    )
+    needs_hotel = models.BooleanField(
+        default=True,
+        verbose_name="Hotel rooms needed",
+        help_text="Hotel room planning is needed for this event.",
+    )
     start_time = models.TimeField(null=True, blank=True)
     end_time = models.TimeField(null=True, blank=True)
     signup_deadline = models.DateTimeField(
@@ -68,6 +78,15 @@ class TravelEvent(models.Model):
     requires_departure = models.BooleanField(
         default=False,
         help_text="Require students to select one of this trip's departures.",
+    )
+    hotel_room_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Number of hotel rooms available for this trip.",
+    )
+    hotel_room_labels = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Actual hotel room numbers keyed by room number.",
     )
     description = models.TextField(
         blank=True,
@@ -150,7 +169,11 @@ class TravelEvent(models.Model):
 
     @property
     def has_multiple_departures(self):
-        return self.departures.count() > 1
+        return self.has_organized_travel and self.departures.count() > 1
+
+    @property
+    def departure_required_for_travel(self):
+        return self.has_organized_travel and self.requires_departure
 
     @property
     def is_past(self):
@@ -299,6 +322,11 @@ class TravelSignup(models.Model):
         blank=True,
         related_name="signups",
     )
+    room_number = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Hotel room assigned by a Lead Mentor.",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=INTERESTED)
     cost_items = models.ManyToManyField(
         TravelCostOption,
@@ -428,7 +456,9 @@ class TravelSignup(models.Model):
             "description": event.description,
             "form_version": str(event.permission_form_version),
             "form_present": bool(event.permission_form),
-            "requires_departure": event.requires_departure,
+            "has_organized_travel": event.has_organized_travel,
+            "needs_hotel": event.needs_hotel,
+            "requires_departure": event.departure_required_for_travel,
             "departure": (
                 [
                     departure.pk,
@@ -527,9 +557,9 @@ class TravelSignup(models.Model):
 
         if self.departure_id:
             departure_status = "Selected"
-            if not self.event.requires_departure:
+            if not self.event.departure_required_for_travel:
                 departure_status = "Selected (optional)"
-        elif self.event.requires_departure:
+        elif self.event.departure_required_for_travel:
             departure_status = "Needed"
         else:
             departure_status = "Optional"
@@ -554,8 +584,8 @@ class TravelSignup(models.Model):
                 "key": "departure",
                 "label": "Departure",
                 "status": departure_status,
-                "required": self.event.requires_departure,
-                "complete": not self.event.requires_departure
+                "required": self.event.departure_required_for_travel,
+                "complete": not self.event.departure_required_for_travel
                 or self.departure_id is not None,
             },
         )
@@ -879,6 +909,11 @@ class TravelMentorSignup(models.Model):
         blank=True,
         related_name="mentor_signups",
     )
+    room_number = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Hotel room assigned by a Lead Mentor.",
+    )
     is_driver = models.BooleanField(
         default=False,
         help_text="Check for mentors who are driving. Set by Lead Mentors.",
@@ -936,6 +971,11 @@ class TravelParentChaperoneSignup(models.Model):
         blank=True,
         related_name="parent_chaperone_signups",
         help_text="Which departure this parent plans to travel with (optional).",
+    )
+    room_number = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Hotel room assigned by a Lead Mentor.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
 

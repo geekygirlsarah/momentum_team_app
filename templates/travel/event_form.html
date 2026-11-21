@@ -2,6 +2,11 @@
 
 {% block title %}{% if form.instance.pk %}Edit{% else %}Add{% endif %} Event - {{ program.name }}{% endblock %}
 
+{% block extra_head %}
+{% load static %}
+<link href="{% static 'css/email_editor.css' %}" rel="stylesheet">
+{% endblock %}
+
 {% block content %}
 <div class="container my-4">
     <div class="row justify-content-center">
@@ -50,6 +55,22 @@
                                 {% if form.is_competition.help_text %}<div class="form-text">{{ form.is_competition.help_text }}</div>{% endif %}
                                 {% if form.is_competition.errors %}<div class="text-danger small">{{ form.is_competition.errors }}</div>{% endif %}
                             </div>
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    {{ form.has_organized_travel }}
+                                    <label for="{{ form.has_organized_travel.id_for_label }}" class="form-check-label">{{ form.has_organized_travel.label }}</label>
+                                </div>
+                                {% if form.has_organized_travel.help_text %}<div class="form-text">{{ form.has_organized_travel.help_text }}</div>{% endif %}
+                                {% if form.has_organized_travel.errors %}<div class="text-danger small">{{ form.has_organized_travel.errors }}</div>{% endif %}
+                            </div>
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    {{ form.needs_hotel }}
+                                    <label for="{{ form.needs_hotel.id_for_label }}" class="form-check-label">{{ form.needs_hotel.label }}</label>
+                                </div>
+                                {% if form.needs_hotel.help_text %}<div class="form-text">{{ form.needs_hotel.help_text }}</div>{% endif %}
+                                {% if form.needs_hotel.errors %}<div class="text-danger small">{{ form.needs_hotel.errors }}</div>{% endif %}
+                            </div>
                             <div class="col-12">
                                 <div class="form-check">
                                     {{ form.requires_departure }}
@@ -84,6 +105,7 @@
                     <div class="card-body">
                         <label for="{{ form.description.id_for_label }}" class="form-label">{{ form.description.label }}</label>
                         {{ form.description }}
+                        <div class="form-text">Use the formatting toolbar for itinerary headings and lists. If the editor does not load, this field remains available as plain text.</div>
                         {% if form.description.help_text %}<div class="form-text">{{ form.description.help_text }}</div>{% endif %}
                         {% if form.description.errors %}<div class="text-danger small">{{ form.description.errors }}</div>{% endif %}
                     </div>
@@ -280,6 +302,8 @@
     </div>
 </template>
 
+{% load static %}
+<script src="{% static 'email-editor.js' %}" nonce="{{ csp_nonce }}"></script>
 <script nonce="{{ csp_nonce }}">
     document.addEventListener('DOMContentLoaded', function () {
         function wireAddButton(addButtonId, containerId, totalFormsInputId, templateId) {

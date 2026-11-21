@@ -14,6 +14,8 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
+from travel.utils import travel_description_as_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,7 +71,7 @@ def sync_travel_event(travel_event, feed):
 
     description_parts = []
     if travel_event.description:
-        description_parts.append(travel_event.description)
+        description_parts.append(travel_description_as_text(travel_event.description))
 
     # Include departure information if present
     departures = list(

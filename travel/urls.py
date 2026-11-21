@@ -9,6 +9,16 @@ urlpatterns = [
     path("create/", views.TravelEventCreateView.as_view(), name="event_create"),
     path("<int:pk>/edit/", views.TravelEventUpdateView.as_view(), name="event_edit"),
     path(
+        "<int:pk>/rooms/",
+        views.TravelRoomAssignmentsView.as_view(),
+        name="room_assignments",
+    ),
+    path(
+        "<int:pk>/emergency-contacts/",
+        views.TravelEmergencyContactsView.as_view(),
+        name="emergency_contacts",
+    ),
+    path(
         "<int:pk>/delete/", views.TravelEventDeleteView.as_view(), name="event_delete"
     ),
     path("events/<int:pk>/signup/", views.TravelSignupView.as_view(), name="signup"),
@@ -31,6 +41,11 @@ urlpatterns = [
         "signups/<int:pk>/edit/",
         views.TravelSignupEditView.as_view(),
         name="signup_edit",
+    ),
+    path(
+        "signups/<int:pk>/costs/",
+        views.TravelSignupCostUpdateView.as_view(),
+        name="signup_costs",
     ),
     path(
         "signups/<int:pk>/departure/",
@@ -76,6 +91,11 @@ urlpatterns = [
         "events/<int:pk>/mentor-cancel/",
         views.TravelMentorCancelView.as_view(),
         name="mentor_cancel",
+    ),
+    path(
+        "mentor-signups/<int:pk>/departure/",
+        views.TravelMentorDepartureView.as_view(),
+        name="mentor_departure",
     ),
     path(
         "mentor-signups/<int:pk>/driver/",

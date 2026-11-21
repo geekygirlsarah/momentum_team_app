@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load form_tags %}
+{% load form_tags travel_tags %}
 
 {% block title %}Travel &amp; Competitions - {{ program.name }}{% endblock %}
 
@@ -53,6 +53,12 @@
                         </div>
                     </div>
                     <div class="d-flex flex-wrap gap-2">
+                        {% if event.can_view_travel_arrangements %}
+                        {% if event.needs_hotel %}
+                        <a href="{% url 'travel:room_assignments' program.id event.id %}" class="btn btn-sm btn-outline-primary">Room assignments</a>
+                        {% endif %}
+                        <a href="{% url 'travel:emergency_contacts' program.id event.id %}" class="btn btn-sm btn-warning"><i class="bi bi-telephone me-1"></i>Emergency contacts</a>
+                        {% endif %}
                         {% if event.requires_permission_form %}
                         <a href="{{ event.permission_form.url }}" class="btn btn-sm btn-outline-secondary" target="_blank" rel="noopener">
                             <i class="bi bi-file-earmark-pdf me-1"></i>Permission Form
@@ -86,7 +92,7 @@
                 {% if is_lead %}
                 <p class="small text-muted mt-2 mb-0">
                     <strong>Travel readiness:</strong> {{ event.travel_ready_signup_count }} of {{ event.travel_active_signup_count }} active sign-up{{ event.travel_active_signup_count|pluralize }} ready.
-                    {% if event.travel_outstanding_signups %}<span class="text-warning fw-semibold">{{ event.travel_outstanding_signups|length }} need follow-up.</span>{% endif %}
+                    {% if event.travel_outstanding_signups %}<span class="badge rounded-pill bg-warning text-dark">{{ event.travel_outstanding_signups|length }} need follow-up.</span>{% endif %}
                     Payment is not included.
                 </p>
                 {% endif %}
@@ -96,25 +102,32 @@
                     <div class="pt-3">
 
                 {% if event.description %}
-                <p class="mb-3">{{ event.description|linebreaksbr }}</p>
+                <div class="mb-3">{{ event.description|travel_description }}</div>
                 {% endif %}
 
                 <div class="row g-3">
                     {# Departures #}
                     <div class="col-md-6">
                         <div class="p-3 bg-light rounded-3 h-100">
-                            <span class="fw-semibold small text-muted text-uppercase d-block mb-2">
-                                <i class="bi bi-sign-turn-slight-right me-1 text-primary"></i>Departures
-                            </span>
-                            {% for d in event.ordered_departures %}
-                            <div class="mb-2">
-                                <strong>{{ d.display_label }}</strong>
-                                {% if d.meeting_location %}<div class="small text-muted"><i class="bi bi-geo-alt me-1"></i>{{ d.meeting_location }}</div>{% endif %}
-                                {% if d.notes %}<div class="small text-muted">{{ d.notes }}</div>{% endif %}
-                            </div>
-                            {% empty %}
-                            <p class="text-muted small mb-0">Departures will be announced soon.</p>
-                            {% endfor %}
+                            {% if event.has_organized_travel %}
+                                <span class="fw-semibold small text-muted text-uppercase d-block mb-2">
+                                    <i class="bi bi-sign-turn-slight-right me-1 text-primary"></i>Departures
+                                </span>
+                                {% for d in event.ordered_departures %}
+                                <div class="mb-2">
+                                    <strong>{{ d.display_label }}</strong>
+                                    {% if d.meeting_location %}<div class="small text-muted"><i class="bi bi-geo-alt me-1"></i>{{ d.meeting_location }}</div>{% endif %}
+                                    {% if d.notes %}<div class="small text-muted">{{ d.notes }}</div>{% endif %}
+                                </div>
+                                {% empty %}
+                                <p class="text-muted small mb-0">Departures will be announced soon.</p>
+                                {% endfor %}
+                            {% else %}
+                                <span class="fw-semibold small text-muted text-uppercase d-block mb-2">
+                                    <i class="bi bi-sign-turn-slight-right me-1 text-primary"></i>Travel
+                                </span>
+                                <p class="text-muted small mb-0">Travel is not arranged through the organization for this event.</p>
+                            {% endif %}
                         </div>
                     </div>
 
@@ -172,8 +185,8 @@
                         {% csrf_token %}
                         <div><label class="small" for="{{ rsvp_form.student.id_for_label }}">Student</label>{{ rsvp_form.student }}</div>
                         <div><label class="small" for="{{ rsvp_form.response.id_for_label }}">Response</label>{{ rsvp_form.response }}</div>
-                        {% if event.has_multiple_departures or event.requires_departure %}
-                        <div><label class="small" for="lead_rsvp_departure_{{ event.id }}">Departure</label><select class="form-select form-select-sm" name="departure" id="lead_rsvp_departure_{{ event.id }}"><option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>{% for departure in event.ordered_departures %}<option value="{{ departure.id }}">{{ departure.display_label }}</option>{% endfor %}</select></div>
+                        {% if event.has_multiple_departures or event.departure_required_for_travel %}
+                        <div><label class="small" for="lead_rsvp_departure_{{ event.id }}">Departure</label><select class="form-select form-select-sm" name="departure" id="lead_rsvp_departure_{{ event.id }}"><option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>{% for departure in event.ordered_departures %}<option value="{{ departure.id }}">{{ departure.display_label }}</option>{% endfor %}</select></div>
                         {% endif %}
                         {% for cost in event.ordered_cost_options %}
                         {% if not cost.is_required %}<div class="form-check"><input class="form-check-input" type="checkbox" name="cost_items" value="{{ cost.id }}" id="lead_rsvp_cost_{{ event.id }}_{{ cost.id }}"><label class="form-check-label small" for="lead_rsvp_cost_{{ event.id }}_{{ cost.id }}">{{ cost.name }} (${{ cost.amount|floatformat:2 }})</label></div>{% endif %}
@@ -196,7 +209,7 @@
                             <thead class="table-light">
                                 <tr>
                                     <th scope="col">Student</th>
-                                    {% if can_manage %}<th scope="col">Approved cost</th>{% endif %}
+                                    {% if can_manage %}<th scope="col">Cost</th>{% endif %}
                                     <th scope="col">Departure</th>
                                     <th scope="col">What's missing</th>
                                     <th scope="col">Signed form</th>
@@ -210,11 +223,11 @@
                             <th scope="row">{{ signup.student.display_name }}</th>
                             {% if can_manage %}
                             <td>
-                                {% if signup.status == 'approved' %}
-                                <strong>{% if signup.approved_total is not None %}${{ signup.approved_total|floatformat:2 }}{% else %}Not recorded{% endif %}</strong>
+                                {% if signup.status == 'approved' or signup.status == 'interested' %}
+                                <strong>${{ signup.roster_current_total|floatformat:2 }}</strong>
                                 <div class="small text-muted">
-                                    Current included costs:
-                                    {% for cost in signup.approval_costs %}{{ cost.name }}{% if not forloop.last %}, {% endif %}{% empty %}None{% endfor %}
+                                    Includes:
+                                    {% for cost in signup.roster_included_costs %}{{ cost.name }} (${{ cost.amount|floatformat:2 }}){% if not forloop.last %}, {% endif %}{% empty %}None{% endfor %}
                                 </div>
                                 {% else %}<span class="text-muted">—</span>{% endif %}
                             </td>
@@ -222,8 +235,9 @@
                             <td>{% if signup.departure %}{% if signup.departure.label %}{{ signup.departure.label }}{% else %}{{ signup.departure.leave_date|date:"N j" }}{% endif %}{% else %}<span class="text-muted">No departure selected</span>{% endif %}</td>
                             <td>
                                 {% if can_manage and signup.can_be_withdrawn %}
-                                {% if signup.roster_missing_requirements %}
+                                {% if signup.status == 'interested' or signup.roster_missing_requirements %}
                                 <ul class="list-unstyled d-flex flex-wrap gap-1 mb-0">
+                                    {% if signup.status == 'interested' %}<li><span class="badge rounded-pill bg-warning text-dark">Parent approval pending</span></li>{% endif %}
                                     {% for requirement in signup.roster_missing_requirements %}
                                     <li><span class="badge rounded-pill bg-warning text-dark">{{ requirement.label }}: {{ requirement.status }}</span></li>
                                     {% endfor %}
@@ -258,8 +272,8 @@
                                         {% csrf_token %}
                                         <button type="submit" class="btn btn-sm btn-outline-danger js-confirm" data-confirm="Withdraw {{ signup.student.display_name }} from {{ event.name }}?">Withdraw</button>
                                     </form>
-                                    {% if event.requires_permission_form or event.has_multiple_departures or event.requires_departure %}
-                                    <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#signup-edit-modal-{{ signup.pk }}" aria-label="Edit forms or departure for {{ signup.student.display_name }}">Edit</button>
+                                    {% if event.requires_permission_form or event.has_multiple_departures or event.departure_required_for_travel or event.roster_cost_options %}
+                                    <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#signup-edit-modal-{{ signup.pk }}" aria-label="Edit trip details for {{ signup.student.display_name }}">Edit</button>
                                     {% endif %}
                                 </div>
                                 {% endif %}
@@ -274,7 +288,7 @@
                     {% for departure_group in status_group.departure_groups %}
                     {% for signup in departure_group.list %}
                     {% if signup.can_be_withdrawn %}
-                    {% if event.requires_permission_form or event.has_multiple_departures or event.requires_departure %}
+                    {% if event.requires_permission_form or event.has_multiple_departures or event.departure_required_for_travel or event.roster_cost_options %}
                     <div class="modal fade" id="signup-edit-modal-{{ signup.pk }}" tabindex="-1" aria-labelledby="signup-edit-modal-title-{{ signup.pk }}" aria-hidden="true">
                         <div class="modal-dialog modal-dialog-centered">
                             <div class="modal-content">
@@ -295,13 +309,13 @@
                                         <button class="btn btn-sm btn-outline-primary mt-2" type="submit">Upload signed form</button>
                                     </form>
                                     {% endif %}
-                                    {% if event.has_multiple_departures or event.requires_departure %}
+                                    {% if event.has_multiple_departures or event.departure_required_for_travel %}
                                     {% if signup.status == 'approved' or signup.status == 'interested' %}
                                     <form action="{% url 'travel:signup_departure' program.id signup.id %}" method="post" class="mb-0">
                                         {% csrf_token %}
                                         <label class="form-label small" for="id_signup_departure_{{ signup.id }}">Departure</label>
-                                        <select name="departure" id="id_signup_departure_{{ signup.id }}" class="form-select form-select-sm" {% if event.requires_departure %}required{% endif %}>
-                                            <option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>
+                                        <select name="departure" id="id_signup_departure_{{ signup.id }}" class="form-select form-select-sm" {% if event.departure_required_for_travel %}required{% endif %}>
+                                            <option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>
                                             {% for departure in event.ordered_departures %}
                                             <option value="{{ departure.id }}" {% if departure.id == signup.departure_id %}selected{% endif %}>{% if departure.label %}{{ departure.label }}{% else %}{{ departure.leave_date|date:"N j" }}{% endif %}</option>
                                             {% endfor %}
@@ -309,6 +323,31 @@
                                         <button type="submit" class="btn btn-sm btn-primary mt-2">Save departure</button>
                                     </form>
                                     {% endif %}
+                                    {% endif %}
+                                    {% if event.roster_cost_options %}
+                                    <div class="border-top mt-3 pt-3">
+                                        <h3 class="h6">Current trip costs</h3>
+                                        <p class="small text-muted mb-2">Current total: <strong>${{ signup.roster_current_total|floatformat:2 }}</strong>. Required costs are included automatically. Optional selections can be changed here; cost changes require guardian approval.</p>
+                                        <form action="{% url 'travel:signup_costs' program.id signup.id %}" method="post">
+                                            {% csrf_token %}
+                                            <ul class="list-unstyled small mb-2">
+                                            {% for cost_row in signup.roster_cost_rows %}
+                                            <li class="mb-1">
+                                                {% if cost_row.option.is_required %}
+                                                <span>{{ cost_row.option.name }} (${{ cost_row.option.amount|floatformat:2 }})</span>
+                                                <span class="badge rounded-pill bg-secondary">Required · included automatically</span>
+                                                {% else %}
+                                                <div class="form-check">
+                                                    <input class="form-check-input" type="checkbox" name="cost_items" value="{{ cost_row.option.pk }}" id="staff_signup_cost_{{ signup.pk }}_{{ cost_row.option.pk }}" {% if cost_row.included %}checked{% endif %}>
+                                                    <label class="form-check-label" for="staff_signup_cost_{{ signup.pk }}_{{ cost_row.option.pk }}">{{ cost_row.option.name }} (${{ cost_row.option.amount|floatformat:2 }})</label>
+                                                </div>
+                                                {% endif %}
+                                            </li>
+                                            {% endfor %}
+                                            </ul>
+                                            <button type="submit" class="btn btn-sm btn-primary">Save costs</button>
+                                        </form>
+                                    </div>
                                     {% endif %}
                                 </div>
                             </div>
@@ -333,12 +372,12 @@
                         <label class="form-label small mb-0" for="id_student_{{ event.id }}">Add a student</label>
                         <div>{{ staff_form.student }}</div>
                     </div>
-                    {% if event.has_multiple_departures or event.requires_departure %}
+                    {% if event.has_multiple_departures or event.departure_required_for_travel %}
                     <div>
                         <label class="form-label small mb-0" for="id_departure_{{ event.id }}">Departure</label>
                         <div>
-                            <select name="departure" id="id_departure_{{ event.id }}" class="form-select form-select-sm" {% if event.requires_departure %}required{% endif %}>
-                                <option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>
+                            <select name="departure" id="id_departure_{{ event.id }}" class="form-select form-select-sm" {% if event.departure_required_for_travel %}required{% endif %}>
+                                <option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>
                                 {% for d in event.ordered_departures %}
                                 <option value="{{ d.id }}">{{ d.display_label }}</option>
                                 {% endfor %}
@@ -492,7 +531,7 @@
                     {% if signup_edit_form %}
                     <form action="{% url 'travel:signup_edit' program.id my_signup.id %}" method="post" class="mt-3 pt-3 border-top">
                         {% csrf_token %}
-                        {% if event.has_multiple_departures or event.requires_departure or my_signup.departure %}
+                        {% if event.has_multiple_departures or event.departure_required_for_travel or my_signup.departure and event.has_organized_travel %}
                         <div class="mb-2">
                             <label class="form-label small mb-0" for="{{ signup_edit_form.departure.id_for_label }}">Departure</label>
                             {{ signup_edit_form.departure }}
@@ -519,11 +558,11 @@
                 <form action="{% url 'travel:signup' program.id event.id %}" method="post" class="card card-body bg-light mt-3">
                     {% csrf_token %}
                     <div class="d-flex flex-wrap align-items-end gap-2">
-                        {% if event.has_multiple_departures or event.requires_departure %}
+                        {% if event.has_multiple_departures or event.departure_required_for_travel %}
                         <div>
                             <label class="form-label small mb-0" for="id_student_departure_{{ event.id }}">Departure</label>
-                            <select name="departure" id="id_student_departure_{{ event.id }}" class="form-select form-select-sm" {% if event.requires_departure %}required{% endif %}>
-                                <option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>
+                            <select name="departure" id="id_student_departure_{{ event.id }}" class="form-select form-select-sm" {% if event.departure_required_for_travel %}required{% endif %}>
+                                <option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>
                                 {% for d in event.ordered_departures %}
                                 <option value="{{ d.id }}">{{ d.display_label }}</option>
                                 {% endfor %}
@@ -570,10 +609,10 @@
                     {% if my_rsvp %}<p class="small mb-2">Your response: <strong>{{ my_rsvp.get_response_display }}</strong></p>{% endif %}
                     {% if not my_signup or my_signup.status == 'withdrawn' or my_signup.status == 'declined' %}
                     {% if not event.signup_closed %}
-                    {% if event.has_multiple_departures or event.requires_departure %}
+                    {% if event.has_multiple_departures or event.departure_required_for_travel %}
                     <label class="small" for="student_rsvp_departure_{{ event.id }}">Departure</label>
                     <select class="form-select form-select-sm mb-2" name="departure" id="student_rsvp_departure_{{ event.id }}">
-                        <option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>
+                        <option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>
                         {% for departure in event.ordered_departures %}<option value="{{ departure.id }}">{{ departure.display_label }}</option>{% endfor %}
                     </select>
                     {% endif %}
@@ -605,7 +644,7 @@
                             </div>
                             <div class="d-flex flex-wrap gap-3 mt-2 text-muted">
                                 {% if parent_signup.departure %}<span>{{ parent_signup.departure.display_label }}</span>{% endif %}
-                                {% if not parent_signup.departure and event.requires_departure %}<span class="text-warning">Departure selection outstanding</span>{% endif %}
+                                {% if not parent_signup.departure and event.departure_required_for_travel %}<span class="text-warning">Departure selection outstanding</span>{% endif %}
                                 {% if parent_signup.status == 'approved' %}<span>Approved cost: ${{ parent_signup.approved_total|floatformat:2 }}</span>
                                 {% elif parent_signup.status == 'interested' %}<span>Current trip cost: ${{ parent_signup.total_cost|floatformat:2 }}</span>{% endif %}
                             </div>
@@ -702,10 +741,10 @@
                     <strong class="d-block mb-3">{{ parent_row.student.display_name }} — competition attendance</strong>
                     {% if parent_rsvp %}<p class="mb-3">Current response: <strong>{{ parent_rsvp.get_response_display }}</strong></p>{% endif %}
                     {% if not event.signup_closed or parent_signup.status == 'interested' or parent_signup.status == 'approved' %}
-                    {% if event.has_multiple_departures or event.requires_departure %}
+                    {% if event.has_multiple_departures or event.departure_required_for_travel %}
                     <label class="form-label" for="parent_rsvp_departure_{{ event.id }}_{{ parent_row.student.pk }}">Departure</label>
                     <select class="form-select mb-3" name="departure" id="parent_rsvp_departure_{{ event.id }}_{{ parent_row.student.pk }}">
-                        <option value="">{% if event.requires_departure %}Choose a departure{% else %}No specific departure{% endif %}</option>
+                        <option value="">{% if event.departure_required_for_travel %}Choose a departure{% else %}No specific departure{% endif %}</option>
                         {% for departure in event.ordered_departures %}<option value="{{ departure.id }}">{{ departure.display_label }}</option>{% endfor %}
                     </select>
                     {% endif %}
@@ -746,16 +785,53 @@
                                 <th scope="row">{{ ms.adult.display_name }}{% if ms.is_driver %} <span class="badge bg-info text-dark">Driver</span>{% endif %}</th>
                                 <td>{% if ms.departure %}{% if ms.departure.label %}{{ ms.departure.label }}{% else %}{{ ms.departure.leave_date|date:"N j" }}{% endif %}{% else %}<span class="text-muted">Not assigned</span>{% endif %}</td>
                                 <td>
+                                    <div class="d-flex flex-wrap gap-1">
+                                    {% if event.roster_departures %}
+                                    <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#mentor-departure-modal-{{ ms.pk }}" aria-label="Edit departure for {{ ms.adult.display_name }}">Edit departure</button>
+                                    {% endif %}
                                     <form action="{% url 'travel:mentor_remove' program.id ms.id %}" method="post" class="mb-0 js-confirm" data-confirm="Remove {{ ms.adult.display_name }} from mentoring {{ event.name }}?">
                                         {% csrf_token %}
                                         <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                                     </form>
+                                    </div>
                                 </td>
                             </tr>
                         {% endfor %}
                         </tbody>
                     </table>
                 </div>
+                {% if event.roster_departures %}
+                {% for ms in event.mentor_signups.all %}
+                <div class="modal fade" id="mentor-departure-modal-{{ ms.pk }}" tabindex="-1" aria-labelledby="mentor-departure-modal-title-{{ ms.pk }}" aria-hidden="true">
+                    <div class="modal-dialog modal-dialog-centered">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h2 class="modal-title h5" id="mentor-departure-modal-title-{{ ms.pk }}">Edit departure for {{ ms.adult.display_name }}</h2>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                            </div>
+                            <form action="{% url 'travel:mentor_departure' program.id ms.pk %}" method="post">
+                                {% csrf_token %}
+                                <div class="modal-body">
+                                    <label class="form-label" for="mentor_departure_choice_{{ ms.pk }}">Departure</label>
+                                    <select class="form-select" name="departure" id="mentor_departure_choice_{{ ms.pk }}">
+                                        {% if not event.departure_required_for_travel %}
+                                        <option value="" {% if not ms.departure_id %}selected{% endif %}>No specific departure</option>
+                                        {% endif %}
+                                        {% for departure in event.roster_departures %}
+                                        <option value="{{ departure.pk }}" {% if departure.pk == ms.departure_id %}selected{% endif %}>{{ departure.display_label }}</option>
+                                        {% endfor %}
+                                    </select>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                                    <button type="submit" class="btn btn-primary">Save departure</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+                {% endif %}
                 {% else %}
                 <p class="text-muted small mb-0">No mentors signed up yet.</p>
                 {% endif %}
@@ -900,11 +976,11 @@
                 <strong>{{ row.student.display_name }}</strong> &mdash; {{ parent_signup.get_status_display }}
                 {% include "travel/_readiness_status.html" with signup=parent_signup %}
                 {% if event.location_address %}<div>{{ event.location_address }}</div>{% endif %}
-                {% if event.description %}<div>{{ event.description|linebreaksbr }}</div>{% endif %}
+                {% if event.description %}<div>{{ event.description|travel_description }}</div>{% endif %}
                 <div>Current trip cost: ${{ parent_signup.total_cost|floatformat:2 }}</div>
                 <div>Included costs: {% for cost in parent_signup.approval_costs %}{{ cost.name }} (${{ cost.amount|floatformat:2 }}){% if not forloop.last %}, {% endif %}{% empty %}None{% endfor %}</div>
                 {% if parent_signup.departure %}<div>Departure: {{ parent_signup.departure.display_label }}</div>{% endif %}
-                {% if not parent_signup.departure and event.requires_departure %}<div>Departure selection outstanding</div>{% endif %}
+                {% if not parent_signup.departure and event.departure_required_for_travel %}<div>Departure selection outstanding</div>{% endif %}
                 {% if event.requires_permission_form %}
                 <div>The signed permission form documents permission to attend. Portal approval confirms the trip choices and current costs. Uploading a form does not submit or replace portal approval.</div>
                 <a href="{{ event.permission_form.url }}" target="_blank" rel="noopener">Review permission form</a>

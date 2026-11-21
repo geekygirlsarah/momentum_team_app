@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}Emergency contacts — {{ event.name }}{% endblock %}
+
+{% block content %}
+<div class="container my-4">
+    <nav aria-label="Travel navigation" class="mb-3">
+        <a href="{% url 'travel:event_list' program.id %}" class="text-decoration-none">&larr; Back to Travel &amp; Competitions</a>
+    </nav>
+    <section class="card shadow-sm border-0 border-top border-3 border-warning rounded-3" aria-labelledby="emergency-contacts-title">
+        <div class="card-header bg-white p-3 p-md-4">
+            <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                <div>
+                    <p class="small text-uppercase text-muted fw-semibold mb-1">{{ event.name }}</p>
+                    <h1 class="h3 fw-bold mb-1" id="emergency-contacts-title">Emergency contacts</h1>
+                    <p class="text-muted mb-0">{{ event.start_date|date:"N j, Y" }}{% if event.end_date and event.end_date != event.start_date %} &ndash; {{ event.end_date|date:"N j, Y" }}{% endif %}</p>
+                </div>
+                <span class="badge text-bg-warning rounded-pill">Trip travelers only</span>
+            </div>
+        </div>
+        <div class="card-body p-3 p-md-4">
+            <div class="alert alert-warning" role="note">
+                Keep this contact list private and use it only for trip coordination or emergencies. Numbers are shown for active travelers and their linked parents or guardians.
+            </div>
+
+            <section class="mb-4" aria-labelledby="student-contacts-title">
+                <h2 class="h5 fw-semibold" id="student-contacts-title">Students and parents or guardians</h2>
+                <div class="table-responsive" tabindex="0" role="region" aria-label="Student and guardian emergency contacts">
+                    <table class="table table-sm table-striped align-middle">
+                        <caption class="visually-hidden">Student and parent or guardian phone numbers for {{ event.name }}</caption>
+                        <thead class="table-light">
+                            <tr><th scope="col">Student</th><th scope="col">Student phone</th><th scope="col">Parent or guardian phone</th></tr>
+                        </thead>
+                        <tbody>
+                        {% for student in students %}
+                            <tr>
+                                <th scope="row">{{ student.name }}</th>
+                                <td>{% if student.phone_number %}{{ student.phone_number }}{% else %}<span class="text-muted">No phone number on file</span>{% endif %}</td>
+                                <td>
+                                    {% for guardian in student.guardians %}
+                                    <div>{{ guardian.name }} — {% if guardian.phone_number %}{{ guardian.phone_number }}{% else %}<span class="text-muted">No phone number on file</span>{% endif %}</div>
+                                    {% empty %}<span class="text-muted">No linked parent or guardian on file</span>
+                                    {% endfor %}
+                                </td>
+                            </tr>
+                        {% empty %}
+                            <tr><td colspan="3" class="text-muted">No current student travelers are signed up.</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section aria-labelledby="adult-contacts-title">
+                <h2 class="h5 fw-semibold" id="adult-contacts-title">Mentors and parent chaperones</h2>
+                <div class="table-responsive" tabindex="0" role="region" aria-label="Mentor and chaperone emergency contacts">
+                    <table class="table table-sm table-striped align-middle">
+                        <caption class="visually-hidden">Mentor and parent chaperone phone numbers for {{ event.name }}</caption>
+                        <thead class="table-light">
+                            <tr><th scope="col">Traveler</th><th scope="col">Role</th><th scope="col">Phone</th></tr>
+                        </thead>
+                        <tbody>
+                        {% for traveler in adult_travelers %}
+                            <tr>
+                                <th scope="row">{{ traveler.name }}</th>
+                                <td>{{ traveler.role_label }}</td>
+                                <td>{% if traveler.phone_number %}{{ traveler.phone_number }}{% else %}<span class="text-muted">No phone number on file</span>{% endif %}</td>
+                            </tr>
+                        {% empty %}
+                            <tr><td colspan="3" class="text-muted">No mentors or parent chaperones are signed up.</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </section>
+</div>
+{% endblock %}

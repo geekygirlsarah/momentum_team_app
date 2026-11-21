@@ -65,7 +65,7 @@ Mentor travel links, profile commitments, and digest highlights follow the
 trip-details read permission; calendar feeds retain their separate access rules.
 
 ### Travel Models
-- **`TravelEvent`**: Destination, `start_date`, `end_date`, optional organization-local `start_time`/`end_time`, optional signup deadline, location, permission form, and an opt-in `requires_departure` setting. Events marked as competitions collect explicit student attendance responses; legacy events remain untimed unless times are entered.
+- **`TravelEvent`**: Destination, `start_date`, `end_date`, optional organization-local `start_time`/`end_time`, optional signup deadline, location, permission form, and independent `has_organized_travel`, `needs_hotel`, and `requires_departure` settings. Competition classification is separate from those travel settings, so a local competition can still collect attendance responses and retain normal guardian approval. When organized travel is off, departure choices are hidden and no departure is required; previously saved departures and traveler assignments are retained. Itinerary descriptions accept formatted TipTap content; page rendering sanitizes rich HTML while preserving legacy plain text, and calendar feeds convert rich descriptions to plain text. Events marked as competitions collect explicit student attendance responses; legacy events remain untimed unless times are entered.
 - **`TravelDeparture`**: Specific bus/flight departures and departure times.
 - **`TravelCostOption`**: Per-traveler fee options. Required options are included for every signup; new options default to required, while existing options are migrated as optional.
 - **`TravelSignup`**: Student registration (`status`: `interested` → `approved` / `declined` / `withdrawn`). Approval posts the approved total to the student's program balance.
@@ -97,6 +97,38 @@ organization. Mentor and parent signup profiles and their adult-student
 eligibility relationships must also belong to that organization. Existing
 mismatched links are hidden from tenant rosters and are not changed or notified;
 signup conflicts are left for separate review.
+
+Current trip travelers and Lead Mentors can view the trip's room chart and
+emergency contact page; only Lead Mentors can change the hotel room count or
+assign room numbers. The pages use tenant-scoped active student signups and
+local mentor and parent-chaperone signups, deduplicating adults who hold both
+roles. Room edits lock the trip and its current signups, reject stale or
+foreign-traveler fields and out-of-range room numbers, and write a
+`TRAVEL_ROOM_ASSIGNMENTS_UPDATED` audit event without contact details. Emergency
+contacts include active students, their linked local parents or guardians, and
+signed-up local mentors and chaperones. This trip-only directory is available
+only to its current travelers and Lead Mentors and intentionally includes the
+trip travelers' phone numbers even when student directory sharing is opted out;
+it must not be used as a program-wide directory.
+
+Hotel planning is independent of organized travel. Lead Mentors first save the
+number of rooms, then assign each student, mentor, or parent chaperone to one of
+those numbered rooms. The chart lists empty rooms and unassigned travelers; room
+numbers can be recorded separately for each numbered room and are visible to
+travelers alongside the chart. Room planning is hidden when an event does not
+need a hotel. Turning hotel planning off does not delete the room count, saved
+room numbers, or assignments. Emergency contacts remain available to current
+event travelers whether or not the event has organized travel or needs a hotel.
+
+Lead Mentors can assign or change a mentor signup's departure. The signup and
+departure must belong to the active organization and the departure must belong
+to the signup's event; a no-op preserves the existing signup.
+
+Lead Mentors can also change an active student signup's optional cost choices.
+Submitted options are restricted to the signup's event and organization, and
+required costs are included automatically. Cost changes use the same approval,
+tracked-charge, audit, and family-notification behavior as student choice
+updates; an unchanged selection does not reopen approval or send a notice.
 
 Student signup transitions lock the event before locking and reloading the
 tenant-scoped signup. Rejoin, withdrawal, guardian decline, and decision undo
@@ -136,7 +168,12 @@ records are preserved for review rather than detached or reassigned.
 - Email templates must not rely on `request` context; they direct users to log in directly to the portal.
 
 Lead Mentors see each active signup's outstanding parent approval, signed form,
-and required departure. Linked local guardians and Lead Mentors may upload signed
+and required departure. The roster's `Cost` column shows the current total and
+included items (required costs plus selected optional costs), rather than the
+historical approval snapshot. The edit modal distinguishes automatically
+included required options from selected and unselected optional options, and the
+missing-items column identifies signups awaiting parent approval. Linked local
+guardians and Lead Mentors may upload signed
 forms; only those guardians and Lead Mentors can download them. Uploading is
 separate from approving the current trip choices. A previously acknowledged form
 does not need acknowledgment again on reapproval if its signed upload is still
@@ -193,4 +230,4 @@ origins and proxies must continue to deny public access to the `private/` prefix
 ### Parent Chaperone and Mentor Signups
 - Any parent with at least one active student in the program can self-register as a chaperone (`TravelParentChaperoneSignup.eligible_adults(program)`).
 - Lead Mentors can add or remove chaperones via `TravelParentChaperoneStaffForm`.
-- Lead Mentors can add active mentors from their organization to a trip and remove mentor signups; mentor candidates, removal lookups, and departure choices are scoped to that organization, program, and event.
+- Lead Mentors can add active mentors from their organization to a trip, change their departure, and remove mentor signups; mentor candidates, departure choices, and roster lookups are scoped to that organization, program, and event.
