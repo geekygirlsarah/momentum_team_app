@@ -5,10 +5,16 @@ from django.urls import reverse
 
 from GoSAdminPortal.adapter import _find_or_provision_user_for_email
 from GoSAdminPortal.context_processors import organization_context
-from organizations.models import Organization, UserOrganizationMembership
+from organizations.models import (
+    Organization,
+    OrganizationSettings,
+    UserOrganizationMembership,
+)
 from organizations.platform_forms import PlatformOrganizationForm
 from organizations.utils import (
     get_default_organization,
+    update_organization_email_settings,
+    update_organization_payment_settings,
     update_organization_settings,
 )
 from programs.models import Adult, Student
@@ -74,6 +80,100 @@ class OrganizationAccountModelMethodTests(TestCase):
         self.assertEqual(self.org.get_setting("org_account_name"), "Sciencey SSO")
         self.assertEqual(self.org.get_setting("org_email_domain"), "sciencey.org")
         self.assertTrue(self.org.get_setting("force_student_org_email"))
+
+    def test_shared_setting_precedence_and_model_setters_keep_stores_in_sync(self):
+        org_settings = OrganizationSettings.objects.create(
+            organization=self.org, data={"org_account_enabled": True}
+        )
+        self.assertTrue(org_settings.get_setting("org_account_enabled"))
+
+        self.org.settings["org_account_enabled"] = False
+        self.org.save(update_fields=["settings", "updated_at"])
+        self.assertFalse(org_settings.get_setting("org_account_enabled"))
+
+        org_settings.set_setting("org_account_enabled", True)
+        self.org.refresh_from_db()
+        org_settings.refresh_from_db()
+        self.assertTrue(self.org.settings["org_account_enabled"])
+        self.assertTrue(org_settings.data["org_account_enabled"])
+
+        self.org.set_setting("org_account_enabled", False)
+        org_settings.refresh_from_db()
+        self.assertFalse(org_settings.data["org_account_enabled"])
+
+    def test_platform_form_preserves_structured_settings_and_syncs_shared_fields(self):
+        self.org.settings = {
+            "portal_title": "Legacy Portal",
+            "theme_color": "#123456",
+            "custom_legacy_setting": "keep legacy value",
+        }
+        self.org.save(update_fields=["settings", "updated_at"])
+        org_settings = OrganizationSettings.objects.create(
+            organization=self.org,
+            data={
+                "portal_title": "Structured Portal",
+                "footer_tagline": "Structured footer",
+                "email_settings": {"logo_url": "https://example.test/logo.png"},
+                "payment_settings": {"instructions": "Pay by check"},
+                "custom_structured_setting": "keep structured value",
+            },
+        )
+
+        initial_form = PlatformOrganizationForm(instance=self.org)
+        self.assertEqual(initial_form["portal_title"].value(), "Legacy Portal")
+        self.assertEqual(initial_form["footer_tagline"].value(), "Structured footer")
+
+        form_data = {
+            "name": self.org.name,
+            "slug": self.org.slug,
+            "subdomain": "",
+            "is_active": "on",
+            "portal_title": "Updated Portal",
+            "footer_tagline": "Structured footer",
+            "contact_email": "",
+            "phone": "",
+            "time_zone": "America/New_York",
+            "theme_color": "#abcdef",
+            "allowed_domains": "",
+            "org_account_name": "",
+            "org_email_domain": "",
+        }
+        form = PlatformOrganizationForm(data=form_data, instance=self.org)
+        self.assertTrue(form.is_valid(), form.errors)
+
+        update_organization_email_settings(
+            self.org, {"notification_from_email": "new@example.test"}
+        )
+        update_organization_payment_settings(
+            self.org,
+            instructions="Pay online",
+            online_payment_url="https://payments.example.test/",
+        )
+        saved_org = form.save()
+
+        saved_org.refresh_from_db()
+        org_settings.refresh_from_db()
+        self.assertEqual(saved_org.settings["portal_title"], "Updated Portal")
+        self.assertEqual(saved_org.settings["theme_color"], "#abcdef")
+        self.assertEqual(
+            saved_org.settings["custom_legacy_setting"], "keep legacy value"
+        )
+        self.assertEqual(org_settings.data["portal_title"], "Updated Portal")
+        self.assertEqual(org_settings.data["footer_tagline"], "Structured footer")
+        self.assertEqual(
+            org_settings.data["custom_structured_setting"], "keep structured value"
+        )
+        self.assertEqual(
+            org_settings.data["email_settings"]["logo_url"],
+            "https://example.test/logo.png",
+        )
+        self.assertEqual(
+            org_settings.data["email_settings"]["notification_from_email"],
+            "new@example.test",
+        )
+        self.assertEqual(
+            org_settings.data["payment_settings"]["instructions"], "Pay online"
+        )
 
 
 class MultiTenantLoginAdapterTests(TestCase):

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-11-22
+
+### Fixed
+- Platform and portal organization settings updates now preserve unrelated shared and structured settings, including email branding, sender identities, and payment instructions.
+
 ## 2026-11-21
 
 ### Added

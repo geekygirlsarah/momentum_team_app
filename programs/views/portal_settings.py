@@ -27,6 +27,7 @@ from organizations.utils import (
     get_organization_payment_settings,
     update_organization_email_settings,
     update_organization_payment_settings,
+    update_organization_sender_account,
 )
 from programs.constants import TEAM_TYPES
 from programs.forms import MentorAgreementForm, PaymentInstructionsForm
@@ -1119,6 +1120,7 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
         email_cfg["notification_from_email"] = _stored_notification_sender(org)
 
         if action == "update_branding":
+            branding_settings = {}
             primary_color = (
                 request.POST.get("primary_color", "").strip()
                 or email_cfg.get("primary_color")
@@ -1190,22 +1192,26 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
                         messages.error(request, f"Invalid logo image file: {e}")
                         return redirect("/programs/settings/?tab=branding")
                 elif url_key not in request.POST:
-                    logo_url = email_cfg.get(url_key, "")
+                    continue
                 elif logo_url.startswith("/"):
                     logo_url = request.build_absolute_uri(logo_url)
-                email_cfg[url_key] = logo_url
+                branding_settings[url_key] = logo_url
 
-            email_cfg["primary_color"] = primary_color
-            email_cfg["secondary_color"] = secondary_color
-            email_cfg["header_text_color"] = header_text_color
-            email_cfg["organization_name"] = organization_name
-            email_cfg["address_line1"] = address_line1
-            email_cfg["address_line2"] = address_line2
-            email_cfg["footer_text"] = footer_text
-            email_cfg["contact_name"] = contact_name
-            email_cfg["contact_email"] = contact_email
+            branding_settings.update(
+                {
+                    "primary_color": primary_color,
+                    "secondary_color": secondary_color,
+                    "header_text_color": header_text_color,
+                    "organization_name": organization_name,
+                    "address_line1": address_line1,
+                    "address_line2": address_line2,
+                    "footer_text": footer_text,
+                    "contact_name": contact_name,
+                    "contact_email": contact_email,
+                }
+            )
 
-            update_organization_email_settings(org, email_cfg)
+            update_organization_email_settings(org, branding_settings)
             messages.success(
                 request, "Email branding & template settings updated successfully."
             )
@@ -1229,16 +1235,19 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
                 "custom_domain_from_email", ""
             ).strip()
 
-            email_cfg["sender_display_name"] = sender_display_name
-            email_cfg["reply_to_email"] = reply_to_email
-            email_cfg["notification_from_email"] = notification_from_email
-            email_cfg["custom_domain"] = {
-                "enabled": custom_domain_enabled,
-                "domain": custom_domain_domain,
-                "from_email": custom_domain_from_email,
-            }
-
-            update_organization_email_settings(org, email_cfg)
+            update_organization_email_settings(
+                org,
+                {
+                    "sender_display_name": sender_display_name,
+                    "reply_to_email": reply_to_email,
+                    "notification_from_email": notification_from_email,
+                    "custom_domain": {
+                        "enabled": custom_domain_enabled,
+                        "domain": custom_domain_domain,
+                        "from_email": custom_domain_from_email,
+                    },
+                },
+            )
             messages.success(request, "Email settings updated successfully.")
             return redirect("/programs/settings/?tab=email")
 
@@ -1254,23 +1263,22 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
                 )
                 return redirect("/programs/settings/?tab=email")
 
-            accounts = list(email_cfg.get("sender_accounts", []))
-            if any(a.get("key") == key for a in accounts):
-                messages.error(
-                    request, f"Sender identity with key '{key}' already exists."
-                )
-                return redirect("/programs/settings/?tab=email")
-
-            accounts.append(
-                {
+            added = update_organization_sender_account(
+                org,
+                action="add",
+                key=key,
+                account={
                     "key": key,
                     "display_name": display_name,
                     "email": email,
                     "reply_to": reply_to,
-                }
+                },
             )
-            email_cfg["sender_accounts"] = accounts
-            update_organization_email_settings(org, email_cfg)
+            if not added:
+                messages.error(
+                    request, f"Sender identity with key '{key}' already exists."
+                )
+                return redirect("/programs/settings/?tab=email")
             messages.success(request, f"Sender identity '{display_name or key}' added.")
             return redirect("/programs/settings/?tab=email")
 
@@ -1280,19 +1288,17 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
             email = request.POST.get("email", "").strip()
             reply_to = request.POST.get("reply_to", "").strip() or email
 
-            accounts = list(email_cfg.get("sender_accounts", []))
-            updated = False
-            for acc in accounts:
-                if acc.get("key") == key:
-                    acc["display_name"] = display_name
-                    acc["email"] = email
-                    acc["reply_to"] = reply_to
-                    updated = True
-                    break
-
+            updated = update_organization_sender_account(
+                org,
+                action="update",
+                key=key,
+                account={
+                    "display_name": display_name,
+                    "email": email,
+                    "reply_to": reply_to,
+                },
+            )
             if updated:
-                email_cfg["sender_accounts"] = accounts
-                update_organization_email_settings(org, email_cfg)
                 messages.success(request, f"Sender identity '{key}' updated.")
             else:
                 messages.error(request, f"Sender identity '{key}' not found.")
@@ -1300,12 +1306,8 @@ class PortalEmailSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View)
 
         elif action == "delete_sender_account":
             key = request.POST.get("key", "").strip().lower()
-            accounts = list(email_cfg.get("sender_accounts", []))
-            initial_count = len(accounts)
-            accounts = [a for a in accounts if a.get("key") != key]
-            if len(accounts) < initial_count:
-                email_cfg["sender_accounts"] = accounts
-                update_organization_email_settings(org, email_cfg)
+            deleted = update_organization_sender_account(org, action="delete", key=key)
+            if deleted:
                 messages.success(request, f"Sender identity '{key}' deleted.")
             return redirect("/programs/settings/?tab=email")
 
