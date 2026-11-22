@@ -14,6 +14,7 @@ from travel.models import (
     TravelParentChaperoneSignup,
     TravelSignup,
 )
+from travel.utils import sanitize_travel_description
 
 
 def _apply_bootstrap_classes(form):
@@ -64,6 +65,8 @@ class TravelEventForm(forms.ModelForm):
         fields = [
             "name",
             "is_competition",
+            "has_organized_travel",
+            "needs_hotel",
             "start_date",
             "end_date",
             "start_time",
@@ -83,11 +86,25 @@ class TravelEventForm(forms.ModelForm):
             "signup_deadline": forms.DateTimeInput(
                 attrs={"type": "datetime-local"}, format="%Y-%m-%dT%H:%M"
             ),
+            "description": forms.Textarea(
+                attrs={
+                    "data-email-editor": "",
+                    "data-email-editor-placeholder": "Add itinerary details...",
+                    "rows": 8,
+                }
+            ),
         }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fields["requires_departure"].help_text = (
+            "When organized travel is enabled, require students to select one "
+            "of this trip's departures."
+        )
         _apply_bootstrap_classes(self)
+
+    def clean_description(self):
+        return sanitize_travel_description(self.cleaned_data.get("description"))
 
 
 class TravelDepartureForm(forms.ModelForm):
@@ -184,8 +201,10 @@ class TravelSignupForm(forms.ModelForm):
         departures = kwargs.pop("departures", None)
         cost_options = kwargs.pop("cost_options", None)
         requires_departure = kwargs.pop("requires_departure", False)
+        departure_enabled = kwargs.pop("departure_enabled", True)
         super().__init__(*args, **kwargs)
         self.requires_departure = requires_departure
+        self.departure_enabled = departure_enabled
         self.cost_options = (
             cost_options
             if cost_options is not None
@@ -215,11 +234,47 @@ class TravelSignupForm(forms.ModelForm):
             (departure.pk, str(departure)) for departure in available_departures
         )
         self.fields["departure"].choices = departure_choices
+        if not departure_enabled:
+            self.fields.pop("departure")
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if (
+            not self.departure_enabled
+            and self.is_bound
+            and self.data.get(self.add_prefix("departure"))
+        ):
+            self.add_error(None, "This event does not use organized travel.")
+        return cleaned_data
 
     def clean_cost_items(self):
         selected = self.cleaned_data["cost_items"]
         required = self.cost_options.filter(is_required=True)
         return selected | required
+
+
+class TravelSignupCostForm(forms.Form):
+    """Lead Mentor cost editor for an existing signup."""
+
+    cost_items = forms.ModelMultipleChoiceField(
+        queryset=TravelCostOption.objects.none(),
+        required=False,
+        widget=forms.CheckboxSelectMultiple,
+    )
+
+    def __init__(self, *args, cost_options=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cost_options = (
+            cost_options
+            if cost_options is not None
+            else TravelCostOption.objects.none()
+        )
+        self.fields["cost_items"].queryset = self.cost_options.filter(is_required=False)
+
+    def clean_cost_items(self):
+        selected = list(self.cleaned_data["cost_items"])
+        required = list(self.cost_options.filter(is_required=True))
+        return required + selected
 
 
 class TravelStaffSignupForm(TravelSignupForm):
@@ -268,6 +323,25 @@ class TravelSignupDepartureForm(forms.ModelForm):
         )
 
 
+class TravelMentorDepartureForm(forms.ModelForm):
+    class Meta:
+        model = TravelMentorSignup
+        fields = ["departure"]
+
+    def __init__(self, *args, **kwargs):
+        departures = kwargs.pop("departures", None)
+        requires_departure = kwargs.pop("requires_departure", False)
+        super().__init__(*args, **kwargs)
+        self.fields["departure"].queryset = (
+            departures if departures is not None else TravelDeparture.objects.none()
+        )
+        self.fields["departure"].required = requires_departure
+        self.fields["departure"].empty_label = (
+            "Choose a departure" if requires_departure else "No specific departure"
+        )
+        _apply_bootstrap_classes(self)
+
+
 class TravelCompetitionRSVPForm(forms.Form):
     student = forms.ModelChoiceField(queryset=Student.objects.none())
     response = forms.ChoiceField(choices=TravelCompetitionRSVP.Response.choices)
@@ -311,7 +385,9 @@ class TravelMentorStaffSignupForm(forms.ModelForm):
         program = kwargs.pop("program", None)
         event = kwargs.pop("event", None)
         departures = kwargs.pop("departures", None)
+        departure_enabled = kwargs.pop("departure_enabled", True)
         super().__init__(*args, **kwargs)
+        self.departure_enabled = departure_enabled
 
         self.fields["adult"].queryset = Adult.objects.none()
         self.fields["departure"].queryset = TravelDeparture.objects.none()
@@ -346,6 +422,18 @@ class TravelMentorStaffSignupForm(forms.ModelForm):
         self.fields["departure"].required = False
         self.fields["departure"].empty_label = "-- Choose a departure --"
         _apply_bootstrap_classes(self)
+        if not departure_enabled:
+            self.fields.pop("departure")
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if (
+            not self.departure_enabled
+            and self.is_bound
+            and self.data.get(self.add_prefix("departure"))
+        ):
+            self.add_error(None, "This event does not use organized travel.")
+        return cleaned_data
 
 
 class TravelApprovalForm(forms.Form):
@@ -370,4 +458,86 @@ class TravelApprovalForm(forms.Form):
                 "permission_acknowledged",
                 "This trip has a permission form that must be acknowledged before approving.",
             )
+        return cleaned_data
+
+
+class TravelRoomAssignmentsForm(forms.Form):
+    room_count = forms.IntegerField(
+        label="Number of hotel rooms",
+        min_value=0,
+        max_value=32767,
+        widget=forms.NumberInput(attrs={"min": 0, "max": 32767}),
+    )
+
+    def __init__(self, *args, event, travelers, **kwargs):
+        self.travelers = travelers
+        super().__init__(*args, **kwargs)
+        self.fields["room_count"].initial = event.hotel_room_count
+        room_labels = (
+            event.hotel_room_labels if isinstance(event.hotel_room_labels, dict) else {}
+        )
+        room_choices = [("", "Not assigned")] + [
+            (
+                room_number,
+                (
+                    f"Room {room_number} — Hotel room {room_labels[str(room_number)]}"
+                    if room_labels.get(str(room_number))
+                    else f"Room {room_number}"
+                ),
+            )
+            for room_number in range(1, event.hotel_room_count + 1)
+        ]
+        for room_number in range(1, event.hotel_room_count + 1):
+            self.fields[f"hotel_room_label_{room_number}"] = forms.CharField(
+                label=f"Hotel room number for Room {room_number}",
+                required=False,
+                max_length=32,
+                initial=room_labels.get(str(room_number), ""),
+                widget=forms.TextInput(attrs={"placeholder": "e.g. 320"}),
+            )
+        for traveler in travelers:
+            self.fields[traveler["room_field"]] = forms.TypedChoiceField(
+                label=f"Room for {traveler['name']}",
+                required=False,
+                choices=room_choices,
+                coerce=int,
+                empty_value=None,
+                initial=traveler["room_number"],
+            )
+        _apply_bootstrap_classes(self)
+
+    def clean(self):
+        cleaned_data = super().clean()
+        room_count = cleaned_data.get("room_count")
+        expected_fields = set(self.fields)
+        unexpected_fields = {
+            key
+            for key in self.data
+            if (key.startswith("room_") or key.startswith("hotel_room_label_"))
+            and key not in expected_fields
+        }
+        if unexpected_fields:
+            raise forms.ValidationError(
+                "A room assignment does not belong to a traveler on this trip."
+            )
+
+        missing_fields = [
+            traveler["room_field"]
+            for traveler in self.travelers
+            if traveler["room_field"] not in self.data
+        ]
+        if missing_fields:
+            raise forms.ValidationError(
+                "The traveler list changed. Reload the page before saving assignments."
+            )
+
+        if room_count is not None:
+            for traveler in self.travelers:
+                field_name = traveler["room_field"]
+                room_number = cleaned_data.get(field_name)
+                if room_number is not None and room_number > room_count:
+                    self.add_error(
+                        field_name,
+                        "Choose a room number no greater than the room count.",
+                    )
         return cleaned_data

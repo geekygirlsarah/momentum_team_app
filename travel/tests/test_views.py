@@ -25,6 +25,7 @@ from programs.models import (
     Student,
 )
 from travel.forms import (
+    TravelEventForm,
     TravelMentorStaffSignupForm,
     TravelParentChaperoneStaffForm,
     TravelSignupDepartureForm,
@@ -123,11 +124,240 @@ class TravelViewTest(TestCase):
     def tearDown(self):
         mail.outbox = []
 
+    def test_lead_can_edit_mentor_departure_but_not_select_another_trip_departure(self):
+        mentor_signup = TravelMentorSignup.objects.create(
+            adult=self.mentor_adult,
+            event=self.event,
+        )
+        other_event = TravelEvent.objects.create(
+            program=self.program,
+            name="Another Trip",
+            start_date=self.event.start_date + timedelta(days=60),
+            end_date=self.event.end_date + timedelta(days=60),
+        )
+        other_departure = TravelDeparture.objects.create(
+            event=other_event,
+            label="Another trip bus",
+            leave_date=other_event.start_date,
+        )
+        foreign_organization = Organization.objects.create(
+            name="Foreign Travel",
+            slug="foreign-travel",
+            subdomain="foreign-travel",
+        )
+        foreign_departure = TravelDeparture.objects.create(
+            organization=foreign_organization,
+            event=self.event,
+            label="Foreign bus",
+            leave_date=self.event.start_date,
+        )
+        url = reverse(
+            "travel:mentor_departure", args=[self.program.pk, mentor_signup.pk]
+        )
+        self.client.force_login(self.lead)
+        roster_response = self.client.get(
+            reverse("travel:event_list", args=[self.program.pk])
+        )
+        self.assertContains(roster_response, "Edit departure")
+        self.assertContains(
+            roster_response, f"mentor-departure-modal-{mentor_signup.pk}"
+        )
+
+        for invalid_departure in (other_departure, foreign_departure):
+            response = self.client.post(url, {"departure": invalid_departure.pk})
+            self.assertEqual(response.status_code, 302)
+            mentor_signup.refresh_from_db()
+            self.assertIsNone(mentor_signup.departure)
+
+        response = self.client.post(url, {"departure": self.departure.pk})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.url, reverse("travel:event_list", args=[self.program.pk])
+        )
+        self.assertEqual(
+            response.wsgi_request.POST["departure"], str(self.departure.pk)
+        )
+        mentor_signup.refresh_from_db()
+        self.assertEqual(
+            mentor_signup.departure,
+            self.departure,
+            [str(message) for message in response.wsgi_request._messages],
+        )
+
+    def test_non_lead_cannot_edit_mentor_departure(self):
+        mentor_signup = TravelMentorSignup.objects.create(
+            adult=self.mentor_adult,
+            event=self.event,
+        )
+        url = reverse(
+            "travel:mentor_departure", args=[self.program.pk, mentor_signup.pk]
+        )
+        self.client.force_login(self.mentor_user)
+
+        response = self.client.post(url, {"departure": self.departure.pk})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("home"))
+        mentor_signup.refresh_from_db()
+        self.assertIsNone(mentor_signup.departure)
+
+    def test_required_trip_does_not_allow_clearing_mentor_departure(self):
+        self.event.requires_departure = True
+        self.event.save(update_fields=["requires_departure"])
+        mentor_signup = TravelMentorSignup.objects.create(
+            adult=self.mentor_adult,
+            event=self.event,
+            departure=self.departure,
+        )
+        url = reverse(
+            "travel:mentor_departure", args=[self.program.pk, mentor_signup.pk]
+        )
+        self.client.force_login(self.lead)
+
+        response = self.client.post(url, {"departure": ""})
+
+        self.assertEqual(response.status_code, 302)
+        mentor_signup.refresh_from_db()
+        self.assertEqual(mentor_signup.departure, self.departure)
+
+    def test_roster_shows_current_costs_parent_approval_and_readable_follow_up(self):
+        self.event.requires_departure = True
+        self.event.save(update_fields=["requires_departure"])
+        TravelDeparture.objects.create(
+            event=self.event,
+            label="Bus 2",
+            leave_date=self.event.start_date,
+        )
+        lunch = TravelCostOption.objects.create(
+            event=self.event,
+            name="Lunch",
+            amount="20.00",
+            is_required=False,
+        )
+        pending_signup = TravelSignup.objects.create(
+            student=self.student,
+            event=self.event,
+            status=TravelSignup.INTERESTED,
+        )
+        pending_signup.cost_items.set([self.van])
+
+        approved_user = User.objects.create_user(
+            username="approved-student",
+            email="approved-student@example.com",
+            password="password",
+        )  # nosec B106
+        approved_student = Student.objects.create(
+            user=approved_user,
+            legal_first_name="Approved",
+            last_name="Student",
+            school=self.school,
+            graduation_year=2027,
+        )
+        Enrollment.objects.create(
+            student=approved_student, program=self.program, active=True
+        )
+        approved_signup = TravelSignup.objects.create(
+            student=approved_student,
+            event=self.event,
+            departure=self.departure,
+        )
+        approved_signup.cost_items.set([self.van])
+        approved_signup.approve(self.parent_adult)
+        approved_signup.save()
+        self.van.amount = Decimal("60.00")
+        self.van.save(update_fields=["amount"])
+
+        self.client.force_login(self.lead)
+        response = self.client.get(reverse("travel:event_list", args=[self.program.pk]))
+        html = response.content.decode()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<th scope="col">Cost</th>', html)
+        self.assertNotIn('<th scope="col">Approved cost</th>', html)
+        self.assertIn(
+            '<span class="badge rounded-pill bg-warning text-dark">'
+            "1 need follow-up.</span>",
+            html,
+        )
+        self.assertIn("Parent approval pending", html)
+        self.assertIn("Hotel", html)
+        self.assertIn("Van", html)
+        self.assertIn("Lunch", html)
+        self.assertRegex(
+            html,
+            rf'id="staff_signup_cost_{pending_signup.pk}_{lunch.pk}"\s+>',
+        )
+
+        approved_row_start = html.index(f'id="travel-signup-{approved_signup.pk}"')
+        approved_row_end = html.index("</tr>", approved_row_start)
+        approved_row = html[approved_row_start:approved_row_end]
+        self.assertIn("$360.00", approved_row)
+        self.assertNotIn("$350.00", approved_row)
+
+    def test_event_description_editor_and_rendering_are_safe_and_preserve_plain_text(
+        self,
+    ):
+        self.client.force_login(self.lead)
+        edit_response = self.client.get(
+            reverse("travel:event_edit", args=[self.program.pk, self.event.pk])
+        )
+        edit_html = edit_response.content.decode()
+        self.assertContains(edit_response, "data-email-editor")
+        self.assertIn("email-editor.js", edit_html)
+        self.assertIn("css/email_editor.css", edit_html)
+        description_field = re.search(
+            r'<textarea\b[^>]*name="description"[^>]*>', edit_html
+        )
+        self.assertIsNotNone(description_field)
+        self.assertNotIn("d-none", description_field.group())
+
+        rich_description = (
+            '<h2>Itinerary</h2><p onclick="alert(1)">Meet <strong>here</strong>.</p>'
+            "<script>alert('unsafe')</script>"
+        )
+        event_form = TravelEventForm(
+            data={**self.event_edit_payload(), "description": rich_description},
+            instance=self.event,
+        )
+        self.assertTrue(event_form.is_valid(), event_form.errors.as_json())
+        self.assertIn("<h2", event_form.cleaned_data["description"])
+        self.assertIn("Itinerary</h2>", event_form.cleaned_data["description"])
+        self.assertNotIn("<script", event_form.cleaned_data["description"])
+        self.assertNotIn("onclick", event_form.cleaned_data["description"])
+
+        self.event.description = rich_description
+        self.event.save(update_fields=["description"])
+        rich_response = self.client.get(
+            reverse("travel:event_list", args=[self.program.pk])
+        )
+        rich_html = rich_response.content.decode()
+        self.assertIn("<h2", rich_html)
+        self.assertIn("Itinerary</h2>", rich_html)
+        self.assertNotIn("alert('unsafe')", rich_html)
+        self.assertNotIn('onclick="alert(1)"', rich_html)
+
+        self.event.description = (
+            "Day 1\nBring lunch & stay together. Use <north> entrance."
+        )
+        self.event.save(update_fields=["description"])
+        plain_response = self.client.get(
+            reverse("travel:event_list", args=[self.program.pk])
+        )
+        self.assertContains(
+            plain_response,
+            "Day 1<br>Bring lunch &amp; stay together. Use &lt;north&gt; entrance.",
+        )
+
     def event_edit_payload(self):
         return {
             "name": self.event.name,
+            "is_competition": "on" if self.event.is_competition else "",
+            "has_organized_travel": "on" if self.event.has_organized_travel else "",
+            "needs_hotel": "on" if self.event.needs_hotel else "",
             "start_date": self.event.start_date.isoformat(),
             "end_date": self.event.end_date.isoformat(),
+            "requires_departure": "on" if self.event.requires_departure else "",
             "location_name": self.event.location_name,
             "location_address": self.event.location_address,
             "description": self.event.description,
@@ -1396,13 +1626,13 @@ class TravelViewTest(TestCase):
         self.assertIn("Bus 2", student_card)
         self.assertIn(f'id="id_departure_{self.event.pk}"', student_card)
         self.assertIn('<th scope="col">Student</th>', student_card)
-        self.assertIn('<th scope="col">Approved cost</th>', student_card)
+        self.assertIn('<th scope="col">Cost</th>', student_card)
         self.assertIn('<th scope="col">Departure</th>', student_card)
         self.assertIn('<th scope="col">Actions</th>', student_card)
         self.assertIn("$350.00", student_card)
-        self.assertRegex(student_card, r"Current included costs:\s*Hotel, Van")
-        self.assertIn("Not recorded", student_card)
-        self.assertRegex(student_card, r"Current included costs:\s*Hotel")
+        self.assertIn("Hotel ($300.00)", student_card)
+        self.assertIn("Van ($50.00)", student_card)
+        self.assertNotIn("Not recorded", student_card)
         self.assertRegex(student_card, r"<td>Bus 1</td>")
         self.assertIn('data-bs-toggle="modal"', student_card)
         self.assertIn(f'id="signup-edit-modal-{student_signup.pk}"', student_card)
@@ -1452,8 +1682,8 @@ class TravelViewTest(TestCase):
         )
         self.assertEqual(mentor_response.status_code, 200)
         mentor_page = mentor_response.content.decode()
-        self.assertNotIn("Approved cost", mentor_page)
-        self.assertNotIn("Current included costs:", mentor_page)
+        self.assertNotIn('<th scope="col">Cost</th>', mentor_page)
+        self.assertNotIn("Current included items:", mentor_page)
         self.assertNotIn("$350.00", mentor_page)
 
     def test_lead_sees_empty_student_parent_and_mentor_cards(self):
@@ -2570,6 +2800,152 @@ class TravelViewTest(TestCase):
         signup.refresh_from_db()
         self.assertIsNone(signup.departure)
         self.assertEqual(signup.status, TravelSignup.INTERESTED)
+
+    def test_lead_can_edit_signup_costs_and_reopen_parent_approval(self):
+        self.event.requires_departure = True
+        self.event.save(update_fields=["requires_departure"])
+        signup = TravelSignup.objects.create(
+            student=self.student,
+            event=self.event,
+            status=TravelSignup.APPROVED,
+            approved_total=Decimal("350.00"),
+            approved_by=self.parent_adult,
+            approved_at=timezone.now(),
+            balance_amount=Decimal("350.00"),
+            balance_effective_date=timezone.localdate(),
+        )
+        signup.cost_items.set([self.hotel, self.van])
+        self.client.force_login(self.lead)
+        url = reverse("travel:signup_costs", args=[self.program.pk, signup.pk])
+
+        roster_response = self.client.get(
+            reverse("travel:event_list", args=[self.program.pk])
+        )
+        self.assertContains(roster_response, f'action="{url}"')
+        self.assertRegex(
+            roster_response.content.decode(),
+            rf'name="cost_items" value="{self.van.pk}"[^>]*checked',
+        )
+        self.assertContains(roster_response, "Required · included automatically")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(url, {"cost_items": []})
+
+        self.assertEqual(response.status_code, 302)
+        signup.refresh_from_db()
+        self.assertIsNone(signup.departure)
+        self.assertEqual(signup.status, TravelSignup.INTERESTED)
+        self.assertIsNone(signup.approved_total)
+        self.assertIsNone(signup.approved_by)
+        self.assertEqual(signup.balance_amount, Decimal("300.00"))
+        self.assertEqual(set(signup.cost_items.all()), {self.hotel})
+        self.assertEqual(
+            AuditLog.objects.filter(
+                organization=self.organization,
+                event="TRAVEL_CHARGE_UPDATED",
+                resource_id=str(signup.pk),
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            {message.to[0] for message in mail.outbox},
+            {"student@example.com", "parent@example.com"},
+        )
+        for message in mail.outbox:
+            self.assertIn("approval", message.body.lower())
+            self.assertIn("300.00", message.body)
+            self.assertIn("350.00", message.body)
+
+    def test_lead_cost_noop_preserves_approval_and_sends_no_notice(self):
+        signup = TravelSignup.objects.create(
+            student=self.student,
+            event=self.event,
+            departure=self.departure,
+            status=TravelSignup.APPROVED,
+            approved_total=Decimal("350.00"),
+            approved_by=self.parent_adult,
+            approved_at=timezone.now(),
+            balance_amount=Decimal("350.00"),
+            balance_effective_date=timezone.localdate(),
+        )
+        signup.cost_items.set([self.hotel, self.van])
+        self.client.force_login(self.lead)
+
+        response = self.client.post(
+            reverse("travel:signup_costs", args=[self.program.pk, signup.pk]),
+            {"cost_items": [self.van.pk]},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, TravelSignup.APPROVED)
+        self.assertEqual(signup.approved_total, Decimal("350.00"))
+        self.assertEqual(signup.balance_amount, Decimal("350.00"))
+        self.assertEqual(set(signup.cost_items.all()), {self.hotel, self.van})
+        self.assertEqual(mail.outbox, [])
+        self.assertFalse(
+            AuditLog.objects.filter(
+                event="TRAVEL_CHARGE_UPDATED", resource_id=str(signup.pk)
+            ).exists()
+        )
+
+    def test_lead_cost_edit_rejects_foreign_or_other_trip_costs(self):
+        signup = TravelSignup.objects.create(
+            student=self.student, event=self.event, departure=self.departure
+        )
+        signup.cost_items.set([self.hotel])
+        other_event = TravelEvent.objects.create(
+            program=self.program,
+            name="Another Cost Trip",
+            start_date=self.event.start_date + timedelta(days=60),
+            end_date=self.event.end_date + timedelta(days=60),
+        )
+        other_trip_cost = TravelCostOption.objects.create(
+            event=other_event,
+            name="Other trip cost",
+            amount="10.00",
+            is_required=False,
+        )
+        foreign_organization = Organization.objects.create(
+            name="Foreign Travel Costs",
+            slug="foreign-travel-costs",
+            subdomain="foreign-travel-costs",
+        )
+        foreign_cost = TravelCostOption.objects.create(
+            organization=foreign_organization,
+            event=self.event,
+            name="Foreign cost",
+            amount="20.00",
+            is_required=False,
+        )
+        self.client.force_login(self.lead)
+        url = reverse("travel:signup_costs", args=[self.program.pk, signup.pk])
+
+        for invalid_cost in (other_trip_cost, foreign_cost):
+            response = self.client.post(
+                url, {"cost_items": [self.van.pk, invalid_cost.pk]}
+            )
+            self.assertEqual(response.status_code, 302)
+            signup.refresh_from_db()
+            self.assertEqual(set(signup.cost_items.all()), {self.hotel})
+            self.assertEqual(signup.status, TravelSignup.INTERESTED)
+
+    def test_non_lead_cannot_edit_signup_costs(self):
+        signup = TravelSignup.objects.create(
+            student=self.student, event=self.event, departure=self.departure
+        )
+        signup.cost_items.set([self.hotel])
+        self.client.force_login(self.mentor_user)
+
+        response = self.client.post(
+            reverse("travel:signup_costs", args=[self.program.pk, signup.pk]),
+            {"cost_items": [self.van.pk]},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("home"))
+        signup.refresh_from_db()
+        self.assertEqual(set(signup.cost_items.all()), {self.hotel})
 
     def test_lead_can_change_departure_without_reapproval_and_notifies_family(self):
         second_departure = TravelDeparture.objects.create(
@@ -3852,6 +4228,74 @@ class TravelOrganizationCreationTests(TestCase):
 
         log_deletion.assert_not_called()
         notify.assert_not_called()
+
+    def test_mentor_departure_edit_rejects_foreign_and_inconsistent_signups(self):
+        foreign_organization = Organization.objects.create(
+            name="Travel Departure Foreign",
+            slug="travel-departure-foreign",
+            subdomain="travel-departure-foreign",
+        )
+        foreign_program = Program.objects.create(organization=foreign_organization)
+        foreign_event = TravelEvent.objects.create(
+            organization=foreign_organization,
+            program=foreign_program,
+            name="Foreign Departure Trip",
+            start_date=self.start_date,
+            end_date=self.start_date + timedelta(days=2),
+        )
+        foreign_departure = TravelDeparture.objects.create(
+            organization=foreign_organization,
+            event=foreign_event,
+            label="Foreign departure",
+            leave_date=self.start_date,
+        )
+        foreign_adult = Adult.objects.create(
+            organization=foreign_organization,
+            legal_first_name="Foreign",
+            last_name="Mentor",
+            is_mentor=True,
+        )
+        local_adult = Adult.objects.create(
+            organization=self.organization,
+            legal_first_name="Local",
+            last_name="Mentor",
+            is_mentor=True,
+        )
+        signups = [
+            TravelMentorSignup.objects.create(
+                organization=foreign_organization,
+                adult=foreign_adult,
+                event=foreign_event,
+            ),
+            TravelMentorSignup.objects.create(
+                organization=foreign_organization,
+                adult=self.lead_adult,
+                event=self.event,
+            ),
+            TravelMentorSignup.objects.create(
+                organization=self.organization,
+                adult=foreign_adult,
+                event=self.event,
+            ),
+            TravelMentorSignup.objects.create(
+                organization=self.organization,
+                adult=local_adult,
+                event=self.event,
+                departure=foreign_departure,
+            ),
+        ]
+
+        expected_departure_ids = [None, None, None, foreign_departure.pk]
+        for signup, expected_departure_id in zip(signups, expected_departure_ids):
+            response = self.tenant_post(
+                reverse("travel:mentor_departure", args=[self.program.pk, signup.pk]),
+                {"departure": self.departure.pk},
+            )
+
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.url, reverse("home"))
+            signup.refresh_from_db()
+            self.assertEqual(signup.departure_id, expected_departure_id)
 
     def test_signup_mutation_views_reject_foreign_owned_signup(self):
         foreign_organization = Organization.objects.create(

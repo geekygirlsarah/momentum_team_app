@@ -5,7 +5,84 @@ Recipient filtering mirrors the fee/payment notification pattern in
 opted-in and a personal email on file are notified.
 """
 
+import re
+from html.parser import HTMLParser
+
 from django.db.models import F, Prefetch
+from django.template.defaultfilters import linebreaksbr
+from django.utils.html import format_html, format_html_join
+
+from programs.utils.email_html import (
+    EMAIL_ALLOWED_ATTRIBUTES,
+    EMAIL_ALLOWED_TAGS,
+    html_to_text,
+    normalize_email_html,
+)
+
+_EMAIL_ALLOWED_TAG_PATTERN = "|".join(
+    re.escape(tag) for tag in sorted(EMAIL_ALLOWED_TAGS, key=len, reverse=True)
+)
+_TRAVEL_DESCRIPTION_HTML_TAG_RE = re.compile(
+    rf"<\s*/?\s*(?:{_EMAIL_ALLOWED_TAG_PATTERN})(?=[\s/>])", re.IGNORECASE
+)
+_TRAVEL_DESCRIPTION_VOID_TAGS = frozenset({"br", "hr", "img"})
+
+
+class _TravelDescriptionHTMLBuilder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in EMAIL_ALLOWED_TAGS:
+            return
+        allowed_attributes = EMAIL_ALLOWED_ATTRIBUTES.get("*", set()) | (
+            EMAIL_ALLOWED_ATTRIBUTES.get(tag, set())
+        )
+        safe_attributes = (
+            (name, value if value is not None else "")
+            for name, value in attrs
+            if name in allowed_attributes
+        )
+        attributes_html = format_html_join("", ' {}="{}"', safe_attributes)
+        self.parts.append(format_html("<{}{}>", tag, attributes_html))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in _TRAVEL_DESCRIPTION_VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if tag in EMAIL_ALLOWED_TAGS and tag not in _TRAVEL_DESCRIPTION_VOID_TAGS:
+            self.parts.append(format_html("</{}>", tag))
+
+    def handle_data(self, data):
+        self.parts.append(format_html("{}", data))
+
+
+def sanitize_travel_description(description):
+    """Keep legacy plain text unchanged and normalize rich editor HTML safely."""
+    description = str(description or "")
+    if not _TRAVEL_DESCRIPTION_HTML_TAG_RE.search(description):
+        return description
+    return normalize_email_html(description)
+
+
+def travel_description_for_display(description):
+    description = str(description or "")
+    if _TRAVEL_DESCRIPTION_HTML_TAG_RE.search(description):
+        parser = _TravelDescriptionHTMLBuilder()
+        parser.feed(sanitize_travel_description(description))
+        parser.close()
+        return format_html_join("", "{}", ((part,) for part in parser.parts))
+    return linebreaksbr(description)
+
+
+def travel_description_as_text(description):
+    description = str(description or "")
+    if not _TRAVEL_DESCRIPTION_HTML_TAG_RE.search(description):
+        return description
+    return html_to_text(sanitize_travel_description(description))
 
 
 def signed_permission_form_prefetches(organization):

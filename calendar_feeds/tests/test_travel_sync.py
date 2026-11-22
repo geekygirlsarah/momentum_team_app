@@ -45,6 +45,25 @@ class TravelSyncTests(TestCase):
         self.assertEqual(cal_event.location, "Sports Arena, 123 Arena Way")
         self.assertIn("Bring safety glasses", cal_event.description)
 
+    def test_rich_travel_description_is_plain_text_in_calendar_event(self):
+        travel = TravelEvent.objects.create(
+            program=self.program,
+            name="Formatted Trip",
+            start_date=date(2026, 10, 20),
+            end_date=date(2026, 10, 22),
+            description=(
+                "<h2>Itinerary</h2><ol><li>Board the bus</li>"
+                "<li>Arrive at the venue</li></ol>"
+            ),
+        )
+
+        cal_event = CalendarEvent.objects.get(source_id=str(travel.pk))
+
+        self.assertIn("Itinerary", cal_event.description)
+        self.assertIn("Board the bus", cal_event.description)
+        self.assertNotIn("<h2", cal_event.description)
+        self.assertNotIn("<ol", cal_event.description)
+
     def test_travel_event_update_updates_calendar_event(self):
         travel = TravelEvent.objects.create(
             program=self.program,

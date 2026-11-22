@@ -1,11 +1,11 @@
-# Girls of Steel Admin Portal
+# Momentum
 
-A Django-based administrative portal for managing administrative tasks for Girls of Steel (GoS).
+A Django-based administrative portal for managing administrative tasks for FIRST robotics teams.
 
 ## Portal Goals
 
 All tasks related to the portal are to try to aim for these three goals:
-1. Reduce the administrative burden for GoS by providing an automated, centralized platform for everything.
+1. Reduce the administrative burden for teams by providing an automated, centralized platform for everything.
 2. Increase transparency and accountability for parents, students, and mentors of the programs.
 3. Increase the data reliability of our participant data.
 
@@ -17,13 +17,13 @@ All tasks related to the portal are to try to aim for these three goals:
 ## Getting Started (Local Development)
 
 1. Clone the repo
-   git clone https://github.com/geekygirlsarah/GoSAdminPortal.git
-   cd GoSAdminPortal
+   git clone https://github.com/geekygirlsarah/momentum_team_app.git
+   cd momentum_team_app
 
 2. Create and activate a virtual environment (recommended)
    python -m venv .venv
    (For Windows) .venv\\Scripts\\activate
-   (For Mac/Linxu) .venv/bin/activate
+   (For Mac/Linux) .venv/bin/activate
 
 3. Install dependencies
    pip install -r requirements.txt

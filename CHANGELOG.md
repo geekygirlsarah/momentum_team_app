@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-11-21
+
+### Added
+- Travel events independently configure organized travel and hotel needs; hotel room charts list numbered rooms and support traveler assignment, while emergency contacts remain available for local events.
+- Lead Mentors can record actual hotel room numbers alongside the numbered room assignments shown to trip travelers.
+- Lead Mentors can edit a mentor's trip departure, with choices restricted to departures for that trip.
+- Lead Mentors can change a student's optional trip costs from the roster; updated costs require guardian approval.
+- Travel itineraries use the existing TipTap editor for headings and lists; rendered descriptions are sanitized and calendar feeds receive plain text.
+
+### Changed
+- Lead student rosters show current trip totals and included cost items, make pending parent approval explicit, and list required/selected/not-selected cost states in the edit modal.
+- Travel readiness follow-up counts use a high-contrast yellow badge with dark text.
+
 ## 2026-11-20
 
 ### Added

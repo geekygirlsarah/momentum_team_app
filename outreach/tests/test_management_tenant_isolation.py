@@ -108,7 +108,9 @@ class OutreachManagementTenantIsolationTests(TestCase):
 
     def test_event_editor_hides_foreign_shift_rows(self):
         foreign_date = timezone.localdate() + timedelta(days=3)
-        OutreachShift.objects.create(
+        self.alpha_shift.max_champions = 17
+        self.alpha_shift.save(update_fields=["max_champions"])
+        foreign_shift = OutreachShift.objects.create(
             organization=self.beta,
             event=self.alpha_event,
             date=foreign_date,
@@ -125,10 +127,17 @@ class OutreachManagementTenantIsolationTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        rendered_shift_ids = [
+            form.instance.pk
+            for form in response.context["shift_formset"].forms
+            if form.instance.pk
+        ]
+        self.assertEqual(rendered_shift_ids, [self.alpha_shift.pk])
+        self.assertNotIn(foreign_shift.pk, rendered_shift_ids)
         self.assertNotIn(
             f'value="{foreign_date.isoformat()}"'.encode(), response.content
         )
-        self.assertNotIn(b'value="17"', response.content)
+        self.assertContains(response, 'name="shifts-0-max_champions" value="17"')
 
     def test_event_editor_cannot_delete_foreign_shift_rows(self):
         foreign_shift = OutreachShift.objects.create(
