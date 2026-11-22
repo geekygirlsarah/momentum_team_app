@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
-from django.db import models
+from django.db import models, transaction
 from django.utils.functional import lazy
 
 from .domain_utils import (
@@ -22,6 +22,16 @@ from .models import (
 )
 
 _PAYMENT_URL_VALIDATOR = URLValidator(schemes=["http", "https"])
+
+
+def _get_locked_organization_settings(organization):
+    locked_org = Organization.objects.select_for_update().get(pk=organization.pk)
+    org_settings, _ = OrganizationSettings.objects.select_for_update().get_or_create(
+        organization=locked_org
+    )
+    if not isinstance(org_settings.data, dict):
+        org_settings.data = {}
+    return locked_org, org_settings
 
 
 def get_organization_payment_settings(
@@ -65,23 +75,19 @@ def update_organization_payment_settings(
     online_payment_url: str,
 ) -> OrganizationSettings:
     """Save payment guidance without replacing unrelated organization settings."""
-    org_settings, _ = OrganizationSettings.objects.get_or_create(
-        organization=organization
-    )
-    if not isinstance(org_settings.data, dict):
-        org_settings.data = {}
-
-    payment_settings = org_settings.data.get("payment_settings")
-    if not isinstance(payment_settings, dict):
-        payment_settings = {}
-    payment_settings.update(
-        {
-            "instructions": instructions.strip(),
-            "online_payment_url": online_payment_url.strip(),
-        }
-    )
-    org_settings.data["payment_settings"] = payment_settings
-    org_settings.save(update_fields=["data", "updated_at"])
+    with transaction.atomic():
+        _, org_settings = _get_locked_organization_settings(organization)
+        payment_settings = org_settings.data.get("payment_settings")
+        if not isinstance(payment_settings, dict):
+            payment_settings = {}
+        payment_settings.update(
+            {
+                "instructions": instructions.strip(),
+                "online_payment_url": online_payment_url.strip(),
+            }
+        )
+        org_settings.data["payment_settings"] = payment_settings
+        org_settings.save(update_fields=["data", "updated_at"])
     return org_settings
 
 
@@ -568,20 +574,69 @@ def update_organization_email_settings(
     organization: Organization,
     email_settings: Dict[str, Any],
 ) -> OrganizationSettings:
-    """Save email settings into OrganizationSettings.data."""
-    org_settings, _ = OrganizationSettings.objects.get_or_create(
-        organization=organization
-    )
-    if not isinstance(org_settings.data, dict):
-        org_settings.data = {}
-    previous = org_settings.data.get("email_settings") or {}
-    email_settings = dict(email_settings)
-    email_settings.pop("portal_url", None)
-    if isinstance(previous, dict) and "portal_url" in previous:
-        email_settings["portal_url"] = previous["portal_url"]
-    org_settings.data["email_settings"] = email_settings
-    org_settings.save(update_fields=["data", "updated_at"])
+    """Merge email settings into the organization's structured settings."""
+    with transaction.atomic():
+        _, org_settings = _get_locked_organization_settings(organization)
+        previous = org_settings.data.get("email_settings")
+        email_cfg = dict(previous) if isinstance(previous, dict) else {}
+        updates = dict(email_settings)
+        updates.pop("portal_url", None)
+        email_cfg.update(updates)
+        if isinstance(previous, dict) and "portal_url" in previous:
+            email_cfg["portal_url"] = previous["portal_url"]
+        org_settings.data["email_settings"] = email_cfg
+        org_settings.save(update_fields=["data", "updated_at"])
     return org_settings
+
+
+def update_organization_sender_account(
+    organization: Organization,
+    *,
+    action: str,
+    key: str,
+    account: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Apply one sender-account change against the latest locked email settings."""
+    with transaction.atomic():
+        _, org_settings = _get_locked_organization_settings(organization)
+        email_cfg = org_settings.data.get("email_settings")
+        email_cfg = dict(email_cfg) if isinstance(email_cfg, dict) else {}
+        accounts = email_cfg.get("sender_accounts")
+        accounts = list(accounts) if isinstance(accounts, list) else []
+        changed = False
+
+        if action == "add":
+            if any(
+                isinstance(item, dict) and item.get("key") == key for item in accounts
+            ):
+                return False
+            accounts.append(dict(account or {}, key=key))
+            changed = True
+        elif action == "update":
+            for index, item in enumerate(accounts):
+                if isinstance(item, dict) and item.get("key") == key:
+                    updated_account = dict(item)
+                    updated_account.update(account or {})
+                    updated_account["key"] = key
+                    accounts[index] = updated_account
+                    changed = True
+                    break
+        elif action == "delete":
+            updated_accounts = [
+                item
+                for item in accounts
+                if not (isinstance(item, dict) and item.get("key") == key)
+            ]
+            changed = len(updated_accounts) < len(accounts)
+            accounts = updated_accounts
+        else:
+            raise ValueError(f"Unsupported sender-account action: {action}")
+
+        if changed:
+            email_cfg["sender_accounts"] = accounts
+            org_settings.data["email_settings"] = email_cfg
+            org_settings.save(update_fields=["data", "updated_at"])
+    return changed
 
 
 def update_organization_settings(
@@ -589,16 +644,17 @@ def update_organization_settings(
     new_settings: Dict[str, Any],
 ) -> OrganizationSettings:
     """Save settings into OrganizationSettings.data and update organization.settings."""
-    org_settings, _ = OrganizationSettings.objects.get_or_create(
-        organization=organization
-    )
-    if not isinstance(org_settings.data, dict):
-        org_settings.data = {}
-    org_settings.data.update(new_settings)
-    org_settings.save(update_fields=["data", "updated_at"])
+    with transaction.atomic():
+        locked_org, org_settings = _get_locked_organization_settings(organization)
+        org_settings.data.update(new_settings)
+        org_settings.save(update_fields=["data", "updated_at"])
 
-    if not isinstance(organization.settings, dict):
-        organization.settings = {}
-    organization.settings.update(new_settings)
-    organization.save(update_fields=["settings", "updated_at"])
+        organization_data = (
+            dict(locked_org.settings) if isinstance(locked_org.settings, dict) else {}
+        )
+        organization_data.update(new_settings)
+        locked_org.settings = organization_data
+        locked_org.save(update_fields=["settings", "updated_at"])
+        organization.settings = organization_data
+        organization.updated_at = locked_org.updated_at
     return org_settings

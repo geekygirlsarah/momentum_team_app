@@ -5,7 +5,7 @@ from decimal import Decimal
 from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models.functions import Lower, Trim
 from django.utils import timezone
 
@@ -45,6 +45,23 @@ DEFAULT_ORGANIZATION_SETTINGS = {
     "force_parent_org_email": False,
     "force_alumni_org_email": False,
 }
+
+SHARED_ORGANIZATION_SETTING_KEYS = (
+    "portal_title",
+    "footer_tagline",
+    "contact_email",
+    "phone",
+    "time_zone",
+    "theme_color",
+    "allowed_domains",
+    "org_account_enabled",
+    "org_account_name",
+    "org_email_domain",
+    "force_mentor_org_email",
+    "force_student_org_email",
+    "force_parent_org_email",
+    "force_alumni_org_email",
+)
 
 
 def generate_domain_verification_token():
@@ -172,6 +189,11 @@ class Organization(models.Model):
 
     def set_setting(self, key, value, save=True):
         """Set a setting value on this organization and optionally save."""
+        if save and self.pk and key in SHARED_ORGANIZATION_SETTING_KEYS:
+            locked_org, _ = _save_shared_organization_setting(self, key, value)
+            self.settings = locked_org.settings
+            self.updated_at = locked_org.updated_at
+            return
         self.settings[key] = value
         if save:
             self.save(update_fields=["settings", "updated_at"])
@@ -242,6 +264,10 @@ class OrganizationSettings(models.Model):
 
     def get_setting(self, key, default=None):
         """Retrieve setting from data, or organization.settings, or DEFAULT_ORGANIZATION_SETTINGS."""
+        if key in SHARED_ORGANIZATION_SETTING_KEYS and self.organization:
+            organization_settings = self.organization.settings
+            if dict.__contains__(organization_settings, key):
+                return dict.__getitem__(organization_settings, key)
         if isinstance(self.data, dict) and key in self.data:
             return self.data[key]
         if self.organization:
@@ -252,6 +278,14 @@ class OrganizationSettings(models.Model):
 
     def set_setting(self, key, value, save=True):
         """Set a setting in self.data and optionally save."""
+        if save and self.organization_id and key in SHARED_ORGANIZATION_SETTING_KEYS:
+            locked_org, settings_obj = _save_shared_organization_setting(
+                self.organization, key, value
+            )
+            self.organization = locked_org
+            self.data = settings_obj.data
+            self.updated_at = settings_obj.updated_at
+            return
         if not isinstance(self.data, dict):
             self.data = {}
         self.data[key] = value
@@ -343,6 +377,32 @@ class OrganizationSettings(models.Model):
     @property
     def email_settings(self):
         return self.get_setting("email_settings", {})
+
+
+def _save_shared_organization_setting(organization, key, value):
+    """Update a shared setting in both stores without replacing either document."""
+    with transaction.atomic():
+        locked_org = Organization.objects.select_for_update().get(pk=organization.pk)
+        organization_data = (
+            dict(locked_org.settings) if isinstance(locked_org.settings, dict) else {}
+        )
+        organization_data[key] = value
+        locked_org.settings = organization_data
+        locked_org.save(update_fields=["settings", "updated_at"])
+
+        (
+            settings_obj,
+            _,
+        ) = OrganizationSettings.objects.select_for_update().get_or_create(
+            organization=locked_org
+        )
+        settings_data = (
+            dict(settings_obj.data) if isinstance(settings_obj.data, dict) else {}
+        )
+        settings_data[key] = value
+        settings_obj.data = settings_data
+        settings_obj.save(update_fields=["data", "updated_at"])
+    return locked_org, settings_obj
 
 
 class UserOrganizationMembership(models.Model):

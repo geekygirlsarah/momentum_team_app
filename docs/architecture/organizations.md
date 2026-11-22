@@ -34,6 +34,14 @@ A OneToOne singleton per organization containing structured settings.
 - Stored as JSON data (`data` field) with dictionary dot-attribute access via `request.organization.settings.<key>`.
 - Defaults are defined in `DEFAULT_ORGANIZATION_SETTINGS` (neutral portal/account branding, custom role labels like "Champion" or "Lead Mentor", no implied clearance requirements, sliding-scale parameters, email templates, and feature flags).
 
+### Settings ownership and synchronization
+
+`Organization.settings` remains the canonical store for the shared platform-managed fields: portal title, footer tagline, public contact details, time zone, theme color, allowed domains, and organization-account options. For these keys, a stored value in `Organization.settings` takes precedence; when that key is absent, platform administration can initialize it from `OrganizationSettings.data`. Platform saves synchronize only these shared keys into both documents and preserve unrelated keys in each document. The model setters and portal organization-account settings action follow the same rule.
+
+Tenant-specific structured settings remain owned by `OrganizationSettings.data`, including `email_settings` and `payment_settings`; they are not copies of the entire platform settings document. Email and payment actions merge their own keys into the latest structured document, and sender-account list changes are applied to the latest locked list. These writers lock the organization first and its settings row second in a transaction, so platform saves and portal updates do not replace unrelated or concurrently saved values. Row-level locking is effective on PostgreSQL; SQLite only provides its database-level locking behavior.
+
+Do not replace either JSON document wholesale when updating organization settings. When adding a shared key, add it to `SHARED_ORGANIZATION_SETTING_KEYS` and keep its platform form, default behavior, and tests aligned. Already-erased custom values are not reconstructed by this synchronization behavior and require a separately reviewed backup recovery.
+
 ### `UserOrganizationMembership`
 Links users to organizations with specific tenant roles:
 - `user`: ForeignKey to `settings.AUTH_USER_MODEL`.

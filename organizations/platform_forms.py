@@ -3,9 +3,11 @@
 from django import forms
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 from audit.events import AuditEvent
 from organizations.models import (
+    SHARED_ORGANIZATION_SETTING_KEYS,
     Organization,
     OrganizationSettings,
     UserOrganizationMembership,
@@ -109,38 +111,23 @@ class PlatformOrganizationForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.instance and self.instance.pk:
-            # Populate settings fields from instance.settings
-            settings = self.instance.settings or {}
-            self.fields["portal_title"].initial = settings.get("portal_title", "")
-            self.fields["footer_tagline"].initial = settings.get("footer_tagline", "")
-            self.fields["contact_email"].initial = settings.get("contact_email", "")
-            self.fields["phone"].initial = settings.get("phone", "")
-            self.fields["time_zone"].initial = settings.get(
-                "time_zone", "America/New_York"
+            organization_data = (
+                dict(self.instance.settings)
+                if isinstance(self.instance.settings, dict)
+                else {}
             )
-            self.fields["theme_color"].initial = settings.get("theme_color", "#0056b3")
-            self.fields["allowed_domains"].initial = settings.get("allowed_domains", "")
-            self.fields["org_account_enabled"].initial = settings.get(
-                "org_account_enabled", False
+            structured_data = (
+                OrganizationSettings.objects.filter(organization=self.instance)
+                .values_list("data", flat=True)
+                .first()
             )
-            self.fields["org_account_name"].initial = settings.get(
-                "org_account_name", ""
-            )
-            self.fields["org_email_domain"].initial = settings.get(
-                "org_email_domain", ""
-            )
-            self.fields["force_mentor_org_email"].initial = settings.get(
-                "force_mentor_org_email", False
-            )
-            self.fields["force_student_org_email"].initial = settings.get(
-                "force_student_org_email", False
-            )
-            self.fields["force_parent_org_email"].initial = settings.get(
-                "force_parent_org_email", False
-            )
-            self.fields["force_alumni_org_email"].initial = settings.get(
-                "force_alumni_org_email", False
-            )
+            if not isinstance(structured_data, dict):
+                structured_data = {}
+            for key in SHARED_ORGANIZATION_SETTING_KEYS:
+                if key in organization_data:
+                    self.fields[key].initial = organization_data[key]
+                elif key in structured_data:
+                    self.fields[key].initial = structured_data[key]
             # Hide initial lead mentor field on edit
             self.fields.pop("initial_lead_mentor_email", None)
 
@@ -193,33 +180,42 @@ class PlatformOrganizationForm(forms.ModelForm):
     def save(self, commit=True):
         org = super().save(commit=False)
         settings_dict = dict(org.settings) if isinstance(org.settings, dict) else {}
-        for key in [
-            "portal_title",
-            "footer_tagline",
-            "contact_email",
-            "phone",
-            "time_zone",
-            "theme_color",
-            "allowed_domains",
-            "org_account_enabled",
-            "org_account_name",
-            "org_email_domain",
-            "force_mentor_org_email",
-            "force_student_org_email",
-            "force_parent_org_email",
-            "force_alumni_org_email",
-        ]:
+        shared_settings = {}
+        for key in SHARED_ORGANIZATION_SETTING_KEYS:
             val = self.cleaned_data.get(key)
             if val is not None:
-                settings_dict[key] = val
+                shared_settings[key] = val
+
+        settings_dict.update(shared_settings)
         org.settings = settings_dict
-        if commit:
+        if not commit:
+            return org
+
+        with transaction.atomic():
+            if org.pk:
+                saved_org = Organization.objects.select_for_update().get(pk=org.pk)
+                for field in self._meta.fields:
+                    setattr(saved_org, field, getattr(org, field))
+                org = saved_org
+                settings_dict = (
+                    dict(org.settings) if isinstance(org.settings, dict) else {}
+                )
+                settings_dict.update(shared_settings)
+                org.settings = settings_dict
+
             org.save()
-            settings_obj, _ = OrganizationSettings.objects.get_or_create(
+            (
+                settings_obj,
+                _,
+            ) = OrganizationSettings.objects.select_for_update().get_or_create(
                 organization=org
             )
-            settings_obj.data = settings_dict
-            settings_obj.save()
+            structured_data = (
+                dict(settings_obj.data) if isinstance(settings_obj.data, dict) else {}
+            )
+            structured_data.update(shared_settings)
+            settings_obj.data = structured_data
+            settings_obj.save(update_fields=["data", "updated_at"])
         return org
 
 

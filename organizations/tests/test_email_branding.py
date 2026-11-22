@@ -109,6 +109,54 @@ class OrganizationEmailBrandingTests(TestCase):
         self.assertEqual(cfg["contact_name"], "Jane Smith")
         self.assertEqual(cfg["contact_email"], "contact@teamhyperion.org")
 
+    def test_partial_email_settings_update_preserves_other_settings_and_tenants(self):
+        self.org_settings.data = {
+            "email_settings": {
+                "logo_url": "https://example.test/brand.png",
+                "sender_display_name": "Sciencey Robotics",
+            },
+            "payment_settings": {"instructions": "Existing payment instructions"},
+            "custom_setting": "preserve this value",
+        }
+        self.org_settings.save()
+        other_org = Organization.objects.create(
+            name="Other Robotics", slug="other-robotics-settings"
+        )
+        other_settings = OrganizationSettings.objects.create(
+            organization=other_org,
+            data={"email_settings": {"notification_from_email": "other@example.test"}},
+        )
+
+        update_organization_email_settings(
+            self.org, {"notification_from_email": "sciencey@example.test"}
+        )
+
+        self.org_settings.refresh_from_db()
+        other_settings.refresh_from_db()
+        self.assertEqual(
+            self.org_settings.data["email_settings"]["logo_url"],
+            "https://example.test/brand.png",
+        )
+        self.assertEqual(
+            self.org_settings.data["email_settings"]["sender_display_name"],
+            "Sciencey Robotics",
+        )
+        self.assertEqual(
+            self.org_settings.data["email_settings"]["notification_from_email"],
+            "sciencey@example.test",
+        )
+        self.assertEqual(
+            self.org_settings.data["payment_settings"]["instructions"],
+            "Existing payment instructions",
+        )
+        self.assertEqual(
+            self.org_settings.data["custom_setting"], "preserve this value"
+        )
+        self.assertEqual(
+            other_settings.data["email_settings"]["notification_from_email"],
+            "other@example.test",
+        )
+
     def test_portal_settings_update_branding_post(self):
         self.org_settings.data = {
             "email_settings": {"portal_url": "https://old.example.com"}
@@ -141,6 +189,54 @@ class OrganizationEmailBrandingTests(TestCase):
         self.assertEqual(cfg.get("address_line1"), "456 Innovation Blvd")
         self.assertEqual(cfg.get("logo_url"), "https://example.org/static/logo.png")
         self.assertEqual(cfg.get("portal_url"), "https://old.example.com")
+
+    def test_portal_branding_and_delivery_actions_preserve_each_others_settings(self):
+        self.org_settings.data = {
+            "email_settings": {
+                "primary_color": "#112233",
+                "logo_url": "https://example.test/brand.png",
+                "sender_display_name": "Old Sender",
+                "reply_to_email": "old-reply@example.test",
+                "notification_from_email": "old-from@example.test",
+            },
+            "payment_settings": {"instructions": "Keep these instructions"},
+        }
+        self.org_settings.save()
+        self.client.force_login(self.user)
+
+        self.client.post(
+            self.url,
+            {
+                "action": "update_email_settings",
+                "sender_display_name": "New Sender",
+                "reply_to_email": "new-reply@example.test",
+                "notification_from_email": "new-from@example.test",
+                "custom_domain_enabled": "on",
+                "custom_domain_domain": "mail.example.test",
+                "custom_domain_from_email": "portal@example.test",
+            },
+        )
+        self.client.post(
+            self.url,
+            {
+                "action": "update_branding",
+                "primary_color": "#445566",
+                "organization_name": "Sciencey Robotics",
+            },
+        )
+
+        self.org_settings.refresh_from_db()
+        email_cfg = self.org_settings.data["email_settings"]
+        self.assertEqual(email_cfg["primary_color"], "#445566")
+        self.assertEqual(email_cfg["logo_url"], "https://example.test/brand.png")
+        self.assertEqual(email_cfg["sender_display_name"], "New Sender")
+        self.assertEqual(email_cfg["reply_to_email"], "new-reply@example.test")
+        self.assertEqual(email_cfg["notification_from_email"], "new-from@example.test")
+        self.assertTrue(email_cfg["custom_domain"]["enabled"])
+        self.assertEqual(
+            self.org_settings.data["payment_settings"]["instructions"],
+            "Keep these instructions",
+        )
 
     @override_settings(
         STORAGES={
