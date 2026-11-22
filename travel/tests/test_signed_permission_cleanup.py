@@ -326,7 +326,9 @@ class SignedPermissionCommitTests(TransactionTestCase):
                 name="Commit", slug="cleanup-commit", subdomain="cleanup-commit"
             )
             program = Program.objects.create(organization=organization, name="Commit")
-            school = School.objects.create(name="Commit school")
+            school = School.objects.create(
+                organization=organization, name="Commit school"
+            )
             student = Student.objects.create(
                 organization=organization,
                 legal_first_name="Test",

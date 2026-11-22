@@ -20,7 +20,9 @@ class TravelConcurrentTransitionTests(TransactionTestCase):
             subdomain="travel-lock-test",
         )
         feature, _ = ProgramFeature.objects.get_or_create(
-            key="travel", defaults={"name": "Travel"}
+            organization=self.organization,
+            key="travel",
+            defaults={"name": "Travel"},
         )
         self.program = Program.objects.create(
             organization=self.organization,
