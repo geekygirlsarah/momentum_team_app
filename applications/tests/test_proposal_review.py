@@ -1,10 +1,14 @@
+import shutil
+import tempfile
 from unittest.mock import patch
 from uuid import uuid4
 
+from cryptography.fernet import Fernet
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
-from django.test import Client, TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -31,9 +35,14 @@ from programs.models import (
     Program,
     ProgramDocument,
     Student,
+    StudentDocument,
 )
 
+_MEDIA_ROOT = tempfile.mkdtemp(prefix="application-proposal-review-")
+_FILE_ENCRYPTION_KEY = Fernet.generate_key().decode()
 
+
+@override_settings(FILE_ENCRYPTION_KEY=_FILE_ENCRYPTION_KEY, MEDIA_ROOT=_MEDIA_ROOT)
 class ApplicationProposalReviewTests(TestCase):
     def setUp(self):
         self.organization = Organization.objects.create(
@@ -69,6 +78,11 @@ class ApplicationProposalReviewTests(TestCase):
         self.client = Client(HTTP_HOST=f"{self.organization.subdomain}.localhost")
         self.client.force_login(reviewer)
         self.application = self.make_application()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(_MEDIA_ROOT, ignore_errors=True)
 
     def make_application(self, **overrides):
         defaults = {
@@ -184,7 +198,7 @@ class ApplicationProposalReviewTests(TestCase):
                 organization=self.organization,
                 application=self.application,
                 document=document,
-                file="private/application_documents/signed.pdf",
+                file=SimpleUploadedFile("signed.pdf", b"signed form content"),
             )
         ApplicationFixedAnswer.objects.create(
             organization=self.organization,
@@ -577,6 +591,150 @@ class ApplicationProposalReviewTests(TestCase):
         self.assertEqual(self.application.status, Application.Status.SUBMITTED)
         self.assertTrue(student.is_incomplete_application_profile)
         self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+
+    def test_approval_transfers_required_document_to_encrypted_student_document(self):
+        student, _ = self.add_new_profile_workflow()
+        document = ProgramDocument.objects.get(
+            program=self.program, name="Permission form"
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        submission = ApplicationDocumentSubmission.objects.get(
+            application=self.application, document=document
+        )
+        with submission.file.open("rb") as signed_file:
+            self.assertEqual(signed_file.read(), b"signed form content")
+        student_document = StudentDocument.objects.get(
+            student=student, program_document=document
+        )
+        with student_document.file.open("rb") as signed_file:
+            self.assertEqual(signed_file.read(), b"signed form content")
+        with student_document.file.storage.open(
+            student_document.file.name, "rb"
+        ) as raw_file:
+            self.assertNotEqual(raw_file.read(), b"signed form content")
+
+    def test_unreadable_document_transfer_rolls_back_profile_finalization(self):
+        student, guardian = self.add_new_profile_workflow()
+        submission = ApplicationDocumentSubmission.objects.get(
+            application=self.application
+        )
+        ApplicationDocumentSubmission.objects.filter(pk=submission.pk).update(
+            file="missing-signed-document.pdf"
+        )
+        submission.refresh_from_db()
+
+        with (
+            patch.object(
+                submission.file.storage,
+                "open",
+                side_effect=FileNotFoundError("missing"),
+            ),
+            patch(
+                "applications.views.review.send_application_approved_email"
+            ) as notice,
+        ):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "signed document could not be copied")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
+        notice.assert_not_called()
+
+    def test_foreign_document_submission_blocks_profile_finalization(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Document Organization",
+            slug="foreign-document-review",
+            subdomain="foreign-document-review",
+        )
+        foreign_program = Program.objects.create(
+            organization=foreign_organization, name="Foreign Program"
+        )
+        foreign_document = ProgramDocument.objects.create(
+            program=foreign_program, name="Foreign release"
+        )
+        ApplicationDocumentSubmission.objects.create(
+            organization=foreign_organization,
+            application=self.application,
+            document=foreign_document,
+            file=SimpleUploadedFile("foreign.pdf", b"foreign signed form"),
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Application documents must belong")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
+
+    def test_mismatched_program_document_blocks_profile_finalization(self):
+        student, guardian = self.add_new_profile_workflow()
+        other_program = Program.objects.create(
+            organization=self.organization, name="Other Program"
+        )
+        other_document = ProgramDocument.objects.create(
+            program=other_program, name="Other program release"
+        )
+        ApplicationDocumentSubmission.objects.create(
+            organization=self.organization,
+            application=self.application,
+            document=other_document,
+            file=SimpleUploadedFile("other.pdf", b"other signed form"),
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Application documents must belong")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
 
     def test_approval_waits_for_required_structured_answers(self):
         student, guardian = self.add_new_profile_workflow()

@@ -1012,6 +1012,114 @@ class ApplicationConversionError(Exception):
     """Raised when an application cannot be converted to a Student."""
 
 
+class ApplicationDocumentTransferError(Exception):
+    """Raised when an application's signed documents cannot be safely copied."""
+
+
+def get_locked_application_document_submissions(application, *, using=None):
+    """Load and validate every current submission without nullable lock joins."""
+    database = using or application._state.db or "default"
+    if not application.organization_id:
+        raise ApplicationDocumentTransferError(
+            "Application documents must belong to this organization and program."
+        )
+
+    submissions = list(
+        ApplicationDocumentSubmission._base_manager.using(database)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+        .select_for_update()
+    )
+    documents = list(
+        ProgramDocument._base_manager.using(database)
+        .filter(pk__in={submission.document_id for submission in submissions})
+        .order_by("pk")
+        .select_for_update()
+    )
+    programs = list(
+        Program._base_manager.using(database)
+        .filter(pk__in={document.program_id for document in documents})
+        .order_by("pk")
+        .select_for_update()
+    )
+    document_by_id = {document.pk: document for document in documents}
+    program_by_id = {program.pk: program for program in programs}
+
+    if len(document_by_id) != len(
+        {submission.document_id for submission in submissions}
+    ):
+        raise ApplicationDocumentTransferError(
+            "Application documents must belong to this organization and program."
+        )
+    for submission in submissions:
+        document = document_by_id.get(submission.document_id)
+        program = program_by_id.get(document.program_id) if document else None
+        if (
+            submission.organization_id != application.organization_id
+            or document is None
+            or program is None
+            or program.organization_id != application.organization_id
+            or document.program_id != application.program_id
+        ):
+            raise ApplicationDocumentTransferError(
+                "Application documents must belong to this organization and program."
+            )
+
+    return submissions, document_by_id
+
+
+def transfer_application_documents_to_student(application, student, *, using=None):
+    """Copy the application's validated, locked documents to its student."""
+    import os
+
+    from django.core.exceptions import SuspiciousFileOperation
+    from django.core.files.base import ContentFile
+
+    from programs.models import StudentDocument
+
+    database = using or application._state.db or "default"
+    if (
+        not application.organization_id
+        or student.organization_id != application.organization_id
+    ):
+        raise ApplicationDocumentTransferError(
+            "Application documents must belong to this organization and program."
+        )
+    submissions, document_by_id = get_locked_application_document_submissions(
+        application, using=database
+    )
+
+    contents_by_submission = []
+    for submission in submissions:
+        if not submission.file:
+            raise ApplicationDocumentTransferError(
+                "A signed document could not be copied to the student profile. "
+                "Please check the application document and try again."
+            )
+        try:
+            with submission.file.open("rb") as signed_file:
+                contents = signed_file.read()
+        except (OSError, SuspiciousFileOperation) as exc:
+            raise ApplicationDocumentTransferError(
+                "A signed document could not be copied to the student profile. "
+                "Please check the application document and try again."
+            ) from exc
+        contents_by_submission.append((submission, contents))
+
+    for submission, contents in contents_by_submission:
+        try:
+            student_document, _ = StudentDocument.objects.using(database).get_or_create(
+                student=student, program_document=document_by_id[submission.document_id]
+            )
+            filename = os.path.basename(submission.file.name)
+            student_document.file.save(filename, ContentFile(contents), save=True)
+        except (OSError, SuspiciousFileOperation) as exc:
+            raise ApplicationDocumentTransferError(
+                "A signed document could not be copied to the student profile. "
+                "Please check the application document and try again."
+            ) from exc
+
+
 def _adult_from_data(parent_data: dict, organization, is_parent: bool = True):
     """Find or create an Adult from a step7-primaryparent/step8-secondaryparent
     (or mentor_info) data dict.
@@ -1372,26 +1480,11 @@ def convert_application_to_student(application: Application, request=None):
             "Application has no program selected; cannot enroll."
         )
 
-    document_submissions = []
-    if application.applicant_type != Application.Type.MENTOR:
-        document_submissions = list(
-            application.document_submissions.select_related("document__program")
-        )
-        for submission in document_submissions:
-            if (
-                submission.organization_id != organization_id
-                or submission.document.program.organization_id != organization_id
-                or submission.document.program_id != application.program_id
-            ):
-                raise ApplicationConversionError(
-                    "Application documents must belong to this organization and program."
-                )
-
     with transaction.atomic():
         current = Application.objects.select_for_update().get(
             pk=application.pk, organization_id=organization_id
         )
-        application.data = current.data
+        application = current
         answers = []
         if application.applicant_type != Application.Type.MENTOR:
             from .answers import extract_experience_answers
@@ -1536,32 +1629,12 @@ def convert_application_to_student(application: Application, request=None):
             program=application.program,
         )
 
-        # Carry over signed documents to the student profile
-        import os
-
-        from django.core.files.base import ContentFile
-
-        from programs.models import StudentDocument
-
-        for submission in document_submissions:
-            if not submission.file:
-                raise ApplicationConversionError(
-                    "A signed document could not be copied to the student profile. "
-                    "Please check the application document and try again."
-                )
-            try:
-                with submission.file.open("rb") as f:
-                    contents = f.read()
-                student_doc, _ = StudentDocument.objects.get_or_create(
-                    student=student, program_document=submission.document
-                )
-                filename = os.path.basename(submission.file.name)
-                student_doc.file.save(filename, ContentFile(contents), save=True)
-            except OSError as exc:
-                raise ApplicationConversionError(
-                    "A signed document could not be copied to the student profile. "
-                    "Please check the application document and try again."
-                ) from exc
+        try:
+            transfer_application_documents_to_student(
+                application, student, using=application._state.db
+            )
+        except ApplicationDocumentTransferError as exc:
+            raise ApplicationConversionError(str(exc)) from exc
 
         log_event(
             request=request,

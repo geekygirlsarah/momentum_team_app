@@ -249,6 +249,14 @@ tenant ownership and program binding. The selected program must have exactly one
 frozen set; a frozen set with no questions is valid, while missing or malformed
 question wording and unanswered required questions block acceptance. These
 checks run before any profile, relationship, enrollment, or answer-copy writes.
+The same approval transaction then copies each validated signed submission to
+the linked student's protected document records; the original application
+submission remains available. A missing or unreadable source, inconsistent
+tenant/program ownership, or failed copy aborts database finalization and
+prevents the acceptance notice. File storage is not transactional with the
+database, so a failed copy can leave an orphaned destination file for staff to
+reconcile; it does not remove or replace the original submission. Legacy
+conversion uses the same validated transfer path.
 
 The read-only `evaluate_application_profile_edit` helper encodes the approved
 exact-linked-account, unique verified-email, and existing linked-guardian rules;

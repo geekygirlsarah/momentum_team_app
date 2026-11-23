@@ -25,7 +25,11 @@ from .models import (
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
 )
-from .services import find_application_person_candidates
+from .services import (
+    ApplicationDocumentTransferError,
+    find_application_person_candidates,
+    transfer_application_documents_to_student,
+)
 
 
 @dataclass
@@ -828,5 +832,9 @@ def finalize_profile_workflow_application(application, request, using=None):
     try:
         save_structured_experience_answers(application, student)
     except ValueError as exc:
+        raise ApplicationFinalizationError(str(exc)) from exc
+    try:
+        transfer_application_documents_to_student(application, student, using=using)
+    except ApplicationDocumentTransferError as exc:
         raise ApplicationFinalizationError(str(exc)) from exc
     return True, student, ""
