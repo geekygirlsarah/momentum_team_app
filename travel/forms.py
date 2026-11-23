@@ -96,7 +96,19 @@ class TravelEventForm(forms.ModelForm):
         }
 
     def __init__(self, *args, **kwargs):
+        explicit_initial = kwargs.get("initial") or {}
         super().__init__(*args, **kwargs)
+        if (
+            not self.instance.pk
+            and not self.is_bound
+            and "is_competition" not in explicit_initial
+        ):
+            self.initial["is_competition"] = True
+        self.fields["is_competition"].label = "Competition"
+        self.fields["is_competition"].help_text = (
+            "Show the Competition badge and collect a separate student attendance "
+            "response."
+        )
         self.fields["requires_departure"].help_text = (
             "When organized travel is enabled, require students to select one "
             "of this trip's departures."

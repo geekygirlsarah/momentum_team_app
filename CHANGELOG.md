@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Platform and portal organization settings updates now preserve unrelated shared and structured settings, including email branding, sender identities, and payment instructions.
 
+### Changed
+- The travel event form defaults new events to competition, which can be turned off for non-competition trips; the option explains its badge and separate student attendance-response behavior.
+- Student, parent chaperone, and mentor roster tables show departure columns only when organized travel is enabled and at least one departure exists.
+
 ## 2026-11-21
 
 ### Added

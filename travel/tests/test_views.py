@@ -295,6 +295,72 @@ class TravelViewTest(TestCase):
         self.assertIn("$360.00", approved_row)
         self.assertNotIn("$350.00", approved_row)
 
+    def test_departure_columns_only_show_for_organized_departures(self):
+        departure_label = self.departure.label
+        signup = TravelSignup.objects.create(
+            organization=self.organization,
+            student=self.student,
+            event=self.event,
+            departure=self.departure,
+        )
+        chaperone_signup = TravelParentChaperoneSignup.objects.create(
+            organization=self.organization,
+            adult=self.parent_adult,
+            event=self.event,
+            departure=self.departure,
+        )
+        mentor_signup = TravelMentorSignup.objects.create(
+            organization=self.organization,
+            adult=self.mentor_adult,
+            event=self.event,
+            departure=self.departure,
+        )
+        self.client.force_login(self.lead)
+        url = reverse("travel:event_list", args=[self.program.pk])
+        table_labels = (
+            f"Student sign-ups for {self.event.name}",
+            f"Parent chaperones for {self.event.name}",
+            f"Mentors going to {self.event.name}",
+        )
+
+        def assert_departure_columns_visible(visible):
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            html = response.content.decode()
+            for label in table_labels:
+                table_start = html.index(f'aria-label="{label}"')
+                table_end = html.index("</table>", table_start)
+                table_html = html[table_start:table_end]
+                with self.subTest(table=label, visible=visible):
+                    self.assertEqual(
+                        '<th scope="col">Departure</th>' in table_html, visible
+                    )
+                    self.assertEqual(departure_label in table_html, visible)
+
+        assert_departure_columns_visible(True)
+
+        self.departure.delete()
+        assert_departure_columns_visible(False)
+
+        retained_departure = TravelDeparture.objects.create(
+            event=self.event,
+            label="Retained bus",
+            leave_date=self.event.start_date,
+        )
+        signup.departure = retained_departure
+        signup.save(update_fields=["departure"])
+        chaperone_signup.departure = retained_departure
+        chaperone_signup.save(update_fields=["departure"])
+        mentor_signup.departure = retained_departure
+        mentor_signup.save(update_fields=["departure"])
+        self.event.has_organized_travel = False
+        self.event.save(update_fields=["has_organized_travel"])
+
+        assert_departure_columns_visible(False)
+        self.assertEqual(signup.departure_id, retained_departure.pk)
+        self.assertEqual(chaperone_signup.departure_id, retained_departure.pk)
+        self.assertEqual(mentor_signup.departure_id, retained_departure.pk)
+
     def test_event_description_editor_and_rendering_are_safe_and_preserve_plain_text(
         self,
     ):
@@ -424,6 +490,31 @@ class TravelViewTest(TestCase):
         self.assertEqual(resp.context["cost_formset"].total_form_count(), 1)
         self.assertIn('class="form-control"', html)
         self.assertIn("Event details", html)
+
+    def test_competition_defaults_on_for_new_events_and_can_be_toggled(self):
+        self.client.force_login(self.lead)
+        create_response = self.client.get(
+            reverse("travel:event_create", args=[self.program.pk])
+        )
+        self.assertEqual(create_response.status_code, 200)
+        self.assertTrue(create_response.context["form"]["is_competition"].value())
+        self.assertContains(
+            create_response,
+            "Show the Competition badge and collect a separate student attendance response.",
+        )
+
+        edit_url = reverse("travel:event_edit", args=[self.program.pk, self.event.pk])
+        edit_response = self.client.get(edit_url)
+        self.assertFalse(edit_response.context["form"]["is_competition"].value())
+
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                payload = self.event_edit_payload()
+                payload["is_competition"] = "on" if enabled else ""
+                response = self.client.post(edit_url, payload)
+                self.assertEqual(response.status_code, 302)
+                self.event.refresh_from_db()
+                self.assertEqual(self.event.is_competition, enabled)
 
     def test_competition_rsvp_yes_keeps_guardian_approval_separate_from_no(self):
         from travel.models import TravelCompetitionRSVP

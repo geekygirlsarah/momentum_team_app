@@ -210,7 +210,9 @@
                                 <tr>
                                     <th scope="col">Student</th>
                                     {% if can_manage %}<th scope="col">Cost</th>{% endif %}
+                                    {% if event.has_organized_travel and event.roster_departures %}
                                     <th scope="col">Departure</th>
+                                    {% endif %}
                                     <th scope="col">What's missing</th>
                                     <th scope="col">Signed form</th>
                                     <th scope="col">Actions</th>
@@ -232,7 +234,9 @@
                                 {% else %}<span class="text-muted">—</span>{% endif %}
                             </td>
                             {% endif %}
+                            {% if event.has_organized_travel and event.roster_departures %}
                             <td>{% if signup.departure %}{% if signup.departure.label %}{{ signup.departure.label }}{% else %}{{ signup.departure.leave_date|date:"N j" }}{% endif %}{% else %}<span class="text-muted">No departure selected</span>{% endif %}</td>
+                            {% endif %}
                             <td>
                                 {% if can_manage and signup.can_be_withdrawn %}
                                 {% if signup.status == 'interested' or signup.roster_missing_requirements %}
@@ -415,13 +419,15 @@
                         <table class="table table-sm align-middle mb-0">
                             <caption class="visually-hidden">Parent chaperones for {{ event.name }}</caption>
                             <thead class="table-light">
-                                <tr><th scope="col">Parent chaperone</th><th scope="col">Departure</th><th scope="col">Actions</th></tr>
+                                <tr><th scope="col">Parent chaperone</th>{% if event.has_organized_travel and event.roster_departures %}<th scope="col">Departure</th>{% endif %}<th scope="col">Actions</th></tr>
                             </thead>
                             <tbody>
                             {% for cs in event.parent_chaperones.all %}
                                 <tr>
                                     <th scope="row">{{ cs.adult.display_name }}</th>
+                                    {% if event.has_organized_travel and event.roster_departures %}
                                     <td>{% if cs.departure %}{% if cs.departure.label %}{{ cs.departure.label }}{% else %}{{ cs.departure.leave_date|date:"N j" }}{% endif %}{% else %}<span class="text-muted">Not assigned</span>{% endif %}</td>
+                                    {% endif %}
                                     <td>
                                         {% if can_manage %}
                                         <form action="{% url 'travel:chaperone_remove' program.id cs.id %}" method="post" class="mb-0 js-confirm" data-confirm="Remove {{ cs.adult.display_name }} from chaperoning {{ event.name }}?">
@@ -777,13 +783,15 @@
                     <table class="table table-sm align-middle mb-0">
                         <caption class="visually-hidden">Mentors going to {{ event.name }}</caption>
                         <thead class="table-light">
-                            <tr><th scope="col">Mentor</th><th scope="col">Departure</th><th scope="col">Actions</th></tr>
+                            <tr><th scope="col">Mentor</th>{% if event.has_organized_travel and event.roster_departures %}<th scope="col">Departure</th>{% endif %}<th scope="col">Actions</th></tr>
                         </thead>
                         <tbody>
                         {% for ms in event.mentor_signups.all %}
                             <tr>
                                 <th scope="row">{{ ms.adult.display_name }}{% if ms.is_driver %} <span class="badge bg-info text-dark">Driver</span>{% endif %}</th>
+                                {% if event.has_organized_travel and event.roster_departures %}
                                 <td>{% if ms.departure %}{% if ms.departure.label %}{{ ms.departure.label }}{% else %}{{ ms.departure.leave_date|date:"N j" }}{% endif %}{% else %}<span class="text-muted">Not assigned</span>{% endif %}</td>
+                                {% endif %}
                                 <td>
                                     <div class="d-flex flex-wrap gap-1">
                                     {% if event.roster_departures %}
