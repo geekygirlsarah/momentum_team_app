@@ -13,6 +13,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from applications.forms import NOT_LISTED_SCHOOL
 from applications.models import (
     Application,
     ApplicationDocumentSubmission,
@@ -1542,6 +1543,360 @@ class ApplicationProposalReviewTests(TestCase):
             ).exists()
         )
         self.assertEqual(student.primary_contact, new_primary)
+
+    def test_typed_profile_draft_editor_is_available_for_review(self):
+        student, guardian = self.add_new_profile_workflow()
+        editor_url = (
+            f"/apply/review/{self.application.application_id}/edit-typed-profiles/"
+        )
+
+        response = self.client.get(editor_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Edit typed profile details")
+        self.assertContains(
+            response, "These edits change only the application-owned drafts"
+        )
+        self.assertContains(response, "Student draft")
+        self.assertContains(response, "Primary guardian")
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+
+    def typed_profile_editor_url(self):
+        return f"/apply/review/{self.application.application_id}/edit-typed-profiles/"
+
+    def valid_typed_profile_post_data(self, response):
+        data = {
+            "state_version": response.context["state_version"],
+            "student-legal_first_name": "Updated Student",
+            "student-preferred_first_name": "",
+            "student-last_name": "Applicant",
+            "student-pronouns": "they/them",
+            "student-date_of_birth": "2012-01-01",
+            "student-confirm_age": "true",
+            "student-address": "123 Main Street",
+            "student-city": "Pittsburgh",
+            "student-state": "PA",
+            "student-zip_code": "15213",
+            "student-personal_email": "student-new@example.test",
+            "student-phone_number": "",
+            "student-phone_type": "cell",
+            "student-can_receive_texts": "false",
+            "student-directory_consent": "true",
+            "student-school_name": NOT_LISTED_SCHOOL,
+            "student-grade": "8",
+            "student-confirm_grade": "false",
+            "student-graduation_year": "2030",
+            "student-allergies": "Peanuts",
+            "student-allergies_answered": "true",
+            "student-dietary_restrictions": "",
+            "student-dietary_restrictions_answered": "false",
+            "student-medical_notes": "Sensitive medical detail",
+            "student-medical_notes_answered": "true",
+            "guardian_primary-legal_first_name": "Updated Guardian",
+            "guardian_primary-preferred_first_name": "",
+            "guardian_primary-last_name": "Applicant",
+            "guardian_primary-pronouns": "",
+            "guardian_primary-relationship_to_student": "parent",
+            "guardian_primary-specific_relationship": "mother",
+            "guardian_primary-email": "guardian@example.test",
+            "guardian_primary-address": "123 Main Street",
+            "guardian_primary-city": "Pittsburgh",
+            "guardian_primary-state": "PA",
+            "guardian_primary-zip_code": "15213",
+            "guardian_primary-phone_number": "4125550100",
+            "guardian_primary-phone_type": "cell",
+            "guardian_primary-can_receive_texts": "true",
+            "guardian_primary-email_updates": "false",
+        }
+        return data
+
+    def test_typed_profile_editor_updates_only_application_drafts_and_resets_reviews(
+        self,
+    ):
+        student, guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        guardian_draft = ApplicationGuardianDraft.objects.get(
+            application=self.application
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        relationships = list(
+            ApplicationRelationshipProposal.objects.filter(application=self.application)
+        )
+        for relationship in relationships:
+            relationship.decision = ApplicationRelationshipProposal.Decision.APPROVED
+            relationship.reviewed_by = self.reviewer
+            relationship.reviewed_at = timezone.now()
+            relationship.save(
+                update_fields=[
+                    "decision",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "updated_at",
+                ]
+            )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft.refresh_from_db()
+        guardian_draft.refresh_from_db()
+        identity.refresh_from_db()
+        for relationship in relationships:
+            relationship.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Updated Student")
+        self.assertEqual(student_draft.allergies, "Peanuts")
+        self.assertEqual(student_draft.medical_notes, "Sensitive medical detail")
+        self.assertFalse(student_draft.can_receive_texts)
+        self.assertEqual(guardian_draft.legal_first_name, "Updated Guardian")
+        self.assertEqual(guardian_draft.phone_number, "4125550100")
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(guardian.legal_first_name, "Guardian")
+        self.assertEqual(
+            identity.decision, ApplicationIdentityProposal.Decision.PENDING
+        )
+        for relationship in relationships:
+            self.assertEqual(
+                relationship.decision,
+                ApplicationRelationshipProposal.Decision.PENDING,
+            )
+            self.assertTrue(relationship.is_baseline_current())
+        audit = AuditLog.objects.filter(
+            organization=self.organization,
+            event=AuditEvent.CONTACT_INFO_UPDATED,
+            resource_type="Application",
+            resource_id=str(self.application.pk),
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertNotIn("Sensitive medical detail", repr(audit.before))
+        self.assertNotIn("Sensitive medical detail", repr(audit.after))
+
+    def test_typed_profile_editor_rejects_stale_draft_without_overwriting_it(self):
+        student, _guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        ApplicationStudentDraft.objects.filter(pk=student_draft.pk).update(
+            legal_first_name="Concurrent Edit"
+        )
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed after you opened this page")
+        student_draft.refresh_from_db()
+        student.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Concurrent Edit")
+        self.assertEqual(student.legal_first_name, "Student")
+
+    def test_typed_profile_editor_rejects_stale_review_decision(self):
+        self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        ApplicationIdentityProposal.objects.filter(pk=identity.pk).update(
+            decision=ApplicationIdentityProposal.Decision.PENDING
+        )
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed after you opened this page")
+        student_draft.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Student")
+
+    def test_typed_profile_editor_allows_unchanged_historical_duplicate_emails(self):
+        self.add_new_profile_workflow(
+            student_draft_values={"personal_email": "guardian@example.test"}
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-personal_email"] = "guardian@example.test"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.personal_email, "guardian@example.test")
+
+    def test_typed_profile_editor_preserves_form_validation(self):
+        student, _guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["guardian_primary-phone_number"] = "not a phone number"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Phone number must be exactly 10 digits.")
+        student_draft.refresh_from_db()
+        student.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Student")
+        self.assertEqual(student.legal_first_name, "Student")
+
+    def test_typed_profile_editor_preserves_existing_graduation_year(self):
+        self.add_new_profile_workflow(student_draft_values={"graduation_year": 2024})
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-graduation_year"] = "2024"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.graduation_year, 2024)
+
+    def test_typed_profile_editor_rejects_new_duplicate_family_email(self):
+        self.add_new_profile_workflow()
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-personal_email"] = "guardian@example.test"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student and guardian contact emails must be different."
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertIsNone(student_draft.personal_email)
+
+    def test_typed_profile_editor_rejects_foreign_organization_race_option(self):
+        self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Race Option Organization",
+            slug="foreign-race-option",
+            subdomain="foreign-race-option",
+        )
+        foreign_race = RaceEthnicity.objects.create(
+            organization=foreign_organization,
+            key="foreign-race",
+            name="Foreign race option",
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-race_ethnicities"] = [str(foreign_race.pk)]
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Select a valid choice")
+        self.assertFalse(
+            ApplicationStudentDraftRaceEthnicity.objects.filter(
+                race_ethnicity=foreign_race
+            ).exists()
+        )
+
+    def test_typed_profile_editor_rejects_missing_and_forged_versions(self):
+        self.add_new_profile_workflow()
+        for token in (None, "forged-version"):
+            response = self.client.get(self.typed_profile_editor_url())
+            data = self.valid_typed_profile_post_data(response)
+            if token is None:
+                data.pop("state_version")
+            else:
+                data["state_version"] = token
+
+            response = self.client.post(self.typed_profile_editor_url(), data)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertContains(response, "changed after you opened this page")
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.legal_first_name, "Student")
+
+    def test_typed_profile_editor_reviewer_permission_and_tenant_are_required(self):
+        self.add_new_profile_workflow()
+        ordinary_user = get_user_model().objects.create_user(
+            username="typed-draft-ordinary-user",
+            email="typed-draft-ordinary@example.test",
+            password=None,
+        )
+        UserOrganizationMembership.objects.create(
+            user=ordinary_user,
+            organization=self.organization,
+            role="Student",
+            is_active=True,
+        )
+        self.client.force_login(ordinary_user)
+        response = self.client.get(self.typed_profile_editor_url())
+        self.assertEqual(response.status_code, 403)
+
+        foreign_organization = Organization.objects.create(
+            name="Foreign Typed Draft Organization",
+            slug="foreign-typed-draft-review",
+            subdomain="foreign-typed-draft-review",
+        )
+        self.client.force_login(self.reviewer)
+        response = self.client.get(
+            self.typed_profile_editor_url(),
+            HTTP_HOST=f"{foreign_organization.subdomain}.localhost",
+        )
+        self.assertIn(response.status_code, (403, 404))
+
+    def test_typed_profile_editor_fails_closed_for_foreign_draft_owner(self):
+        self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Draft Owner",
+            slug="foreign-draft-owner",
+            subdomain="foreign-draft-owner",
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        ApplicationStudentDraft.objects.filter(pk=student_draft.pk).update(
+            organization=foreign_organization
+        )
+
+        response = self.client.get(self.typed_profile_editor_url())
+
+        self.assertRedirects(
+            response,
+            reverse("apply_start"),
+            fetch_redirect_response=False,
+        )
 
 
 class StructuredAnswerReviewTests(TestCase):

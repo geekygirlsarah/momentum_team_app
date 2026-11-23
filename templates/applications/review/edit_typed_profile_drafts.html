@@ -1,0 +1,58 @@
+{% extends 'applications/review/_base.html' %}
+{% block review_title %}Edit typed details {{ application.application_id }}{% endblock %}
+{% block review_heading %}Edit typed profile details <code>{{ application.application_id }}</code>{% endblock %}
+{% block review_body %}
+  <div class="alert alert-info" role="note">
+    These edits change only the application-owned drafts. Linked live profiles and guardian relationships remain unchanged. Saving changed details resets identity and relationship decisions, which must be reviewed again before acceptance.
+  </div>
+  <form method="post" class="mb-3">
+    {% csrf_token %}
+    <input type="hidden" name="state_version" value="{{ state_version }}">
+    {% if student_form.non_field_errors %}
+      <div class="alert alert-danger" role="alert">{{ student_form.non_field_errors }}</div>
+    {% endif %}
+
+    <section class="card shadow-sm mb-4">
+      <div class="card-header"><h2 class="h5 mb-0">Student draft</h2></div>
+      <div class="card-body">
+        {% for hidden in student_form.hidden_fields %}{{ hidden }}{% endfor %}
+        {% for field in student_form.visible_fields %}
+          <div class="mb-3">
+            <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+            {% if field.help_text %}<div class="form-text mb-1">{{ field.help_text }}</div>{% endif %}
+            {{ field }}
+            {% for error in field.errors %}<div class="text-danger small">{{ error }}</div>{% endfor %}
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    {% for entry in guardian_forms %}
+      <section class="card shadow-sm mb-4">
+        <div class="card-header"><h2 class="h5 mb-0">{{ entry.label }}</h2></div>
+        <div class="card-body">
+          {% if entry.form %}
+            {% if entry.form.non_field_errors %}
+              <div class="alert alert-danger" role="alert">{{ entry.form.non_field_errors }}</div>
+            {% endif %}
+            {% for field in entry.form.visible_fields %}
+              <div class="mb-3">
+                <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+                {% if field.help_text %}<div class="form-text mb-1">{{ field.help_text }}</div>{% endif %}
+                {{ field }}
+                {% for error in field.errors %}<div class="text-danger small">{{ error }}</div>{% endfor %}
+              </div>
+            {% endfor %}
+          {% elif entry.draft and entry.draft.presence == 'skipped' %}
+            <p class="text-muted mb-0">This guardian contact was marked as skipped and is not editable here.</p>
+          {% else %}
+            <p class="text-muted mb-0">No guardian details were provided for this contact.</p>
+          {% endif %}
+        </div>
+      </section>
+    {% endfor %}
+
+    <button class="btn btn-primary" type="submit">Save typed details</button>
+    <a class="btn btn-outline-secondary" href="{% url 'application_review_detail' application.application_id %}">Cancel</a>
+  </form>
+{% endblock %}

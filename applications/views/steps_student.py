@@ -26,8 +26,13 @@ from ..answers import (
     build_custom_question_snapshot,
     experience_form_version,
     freeze_custom_question_snapshot,
+    freeze_structured_question_set,
+    structured_experience_form_version,
+    structured_fixed_experience_answers,
+    structured_question_snapshot,
     switch_custom_question_snapshot,
     validate_custom_question_snapshot,
+    validate_structured_application_answers,
 )
 from ..forms import (
     NOT_LISTED_SCHOOL,
@@ -44,6 +49,9 @@ from ..forms import (
 from ..models import (
     Application,
     ApplicationDocumentSubmission,
+    ApplicationFixedAnswer,
+    ApplicationQuestionAnswer,
+    ApplicationQuestionSet,
     OtpVerifyResult,
     normalize_step_keys,
 )
@@ -1184,7 +1192,16 @@ class Step6ExperienceView(View):
             return guard
 
         snapshot, version, error = self._prepare_question_state(application)
-        initial = normalize_step_keys(application.data).get("step6-experience") or {}
+        if application.profile_workflow_version == 1:
+            try:
+                initial = structured_fixed_experience_answers(application)
+            except ValueError as exc:
+                initial = {}
+                error = str(exc)
+        else:
+            initial = (
+                normalize_step_keys(application.data).get("step6-experience") or {}
+            )
         initial["experience_version"] = version
         form = StudentExperienceForm(
             initial=initial,
@@ -1205,7 +1222,9 @@ class Step6ExperienceView(View):
         if guard is not None:
             return guard
 
-        snapshot, version, state_error = self._prepare_question_state(application)
+        snapshot, version, state_error = self._prepare_question_state(
+            application, freeze_structured=False
+        )
         form = StudentExperienceForm(
             request.POST,
             applicant_type=application.applicant_type,
@@ -1217,6 +1236,14 @@ class Step6ExperienceView(View):
             return self._render(request, application, form)
         if not form.is_valid():
             return self._render(request, application, form)
+        if application.profile_workflow_version == 1:
+            return self._post_structured(
+                request,
+                application,
+                form,
+                version,
+                form.answered_snapshot(),
+            )
         current_data = application.data or {}
         needs_version = bool(snapshot) or bool(current_data.get("step6-experience"))
         posted_version = request.POST.get("experience_version", "")
@@ -1284,9 +1311,22 @@ class Step6ExperienceView(View):
         return redirect("apply_step7", app_id=application.application_id)
 
     @staticmethod
-    def _prepare_question_state(application):
+    def _prepare_question_state(application, freeze_structured=True):
         snapshot = []
         try:
+            if application.profile_workflow_version == 1:
+                if freeze_structured:
+                    snapshot = freeze_structured_question_set(application)
+                    application.refresh_from_db()
+                else:
+                    snapshot = structured_question_snapshot(application)
+                    if snapshot is None:
+                        raise ValueError(
+                            "The program changed or its question set is not loaded. "
+                            "Reload this page before continuing."
+                        )
+                version = structured_experience_form_version(application)
+                return snapshot, version, None
             if application.program_id:
                 snapshot = freeze_custom_question_snapshot(application)
                 application.refresh_from_db()
@@ -1294,6 +1334,133 @@ class Step6ExperienceView(View):
             return snapshot, version, None
         except ValueError as exc:
             return [], "", str(exc)
+
+    def _post_structured(self, request, application, form, version, answered_snapshot):
+        using = application._state.db
+        posted_version = request.POST.get("experience_version", "")
+        fixed_answers = {
+            key: value
+            for key, value in form.cleaned_data.items()
+            if key
+            in (
+                "interest_reason",
+                "hoped_gains",
+                "prior_robotics_experience",
+                "referral_source",
+            )
+        }
+        with transaction.atomic(using=using):
+            current = _locked_application_queryset(
+                using, application.pk, application.organization_id
+            ).first()
+            if current is None:
+                return redirect("apply_start")
+            guard = _step_write_guard(request, current, application)
+            if guard is not None:
+                return guard
+            if (
+                current.profile_workflow_version != application.profile_workflow_version
+                or current.profile_workflow_version != 1
+            ):
+                form.add_error(
+                    None,
+                    "The application workflow changed while this form was open. "
+                    "Reload the page before continuing.",
+                )
+                return self._render(request, current, form)
+            if current.program_id != application.program_id:
+                form.add_error(
+                    None,
+                    "The selected program changed while this form was being saved. "
+                    "Please review your answers and submit them again.",
+                )
+                return self._render(request, current, form)
+            try:
+                current_version = structured_experience_form_version(
+                    current, using=using, lock=True
+                )
+            except ValueError as exc:
+                form.add_error(None, str(exc))
+                return self._render(request, current, form)
+            if not constant_time_compare(
+                posted_version, version
+            ) or not constant_time_compare(current_version, version):
+                form.add_error(
+                    None,
+                    "Your application answers changed after you opened this page. "
+                    "Your entries are still shown but were not saved. Reload the page "
+                    "before trying again.",
+                )
+                return self._render(request, current, form)
+            try:
+                current_snapshot = structured_question_snapshot(current, using=using)
+                if current_snapshot is None:
+                    raise ValueError("Program-specific questions have not been frozen.")
+                if set(fixed_answers) != {
+                    "interest_reason",
+                    "hoped_gains",
+                    "prior_robotics_experience",
+                    "referral_source",
+                } or any(
+                    not isinstance(value, str) for value in fixed_answers.values()
+                ):
+                    raise ValueError("Fixed application answers are malformed.")
+                submitted = {item["question_id"]: item for item in answered_snapshot}
+                if len(submitted) != len(current_snapshot) or any(
+                    item["question_id"] not in submitted
+                    or submitted[item["question_id"]].get("question_text")
+                    != item["question_text"]
+                    or submitted[item["question_id"]].get("required")
+                    is not item["required"]
+                    or not isinstance(submitted[item["question_id"]].get("answer"), str)
+                    for item in current_snapshot
+                ):
+                    raise ValueError("The frozen application question set changed.")
+                question_set = ApplicationQuestionSet._base_manager.using(using).get(
+                    application_id=current.pk,
+                    organization_id=current.organization_id,
+                    program_id=current.program_id,
+                )
+                question_answers = list(
+                    ApplicationQuestionAnswer._base_manager.using(using)
+                    .filter(question_set_id=question_set.pk)
+                    .order_by("position", "pk")
+                    .select_for_update()
+                )
+                if len(question_answers) != len(current_snapshot):
+                    raise ValueError("The frozen application question set changed.")
+                submitted_by_id = {
+                    str(item["question_id"]): item for item in answered_snapshot
+                }
+                for row, frozen_item in zip(question_answers, current_snapshot):
+                    posted = submitted_by_id.get(str(row.question_id))
+                    if (
+                        posted is None
+                        or row.organization_id != current.organization_id
+                        or row.question_text != frozen_item["question_text"]
+                        or row.is_required != frozen_item["required"]
+                    ):
+                        raise ValueError("The frozen application question set changed.")
+                for key, answer in fixed_answers.items():
+                    ApplicationFixedAnswer.objects.using(using).update_or_create(
+                        organization_id=current.organization_id,
+                        application_id=current.pk,
+                        source_step="step6-experience",
+                        question_key=key,
+                        defaults={"answer": answer},
+                    )
+                for row in question_answers:
+                    row.answer = submitted_by_id[str(row.question_id)]["answer"]
+                    row.save(using=using, update_fields=["answer"])
+            except ValueError as exc:
+                form.add_error(None, str(exc))
+                return self._render(request, current, form)
+            current.current_step = max(current.current_step, 7)
+            current.applicant_progress_at = timezone.now()
+            current.save(
+                update_fields=["current_step", "applicant_progress_at", "updated_at"]
+            )
+        return redirect("apply_step7", app_id=application.application_id)
 
     def _render(self, request, application, form):
         return render(
@@ -2057,6 +2224,13 @@ class Step9ConfirmView(View):
                     "Please review the application before submitting again.",
                 )
                 return self._render(request, current, form)
+            if current.profile_workflow_version != application.profile_workflow_version:
+                form.add_error(
+                    None,
+                    "The application workflow changed while you were confirming. "
+                    "Please review the application before submitting again.",
+                )
+                return self._render(request, current, form)
 
             try:
                 snapshot, needs_question_step = self._confirmation_snapshot(current)
@@ -2066,7 +2240,10 @@ class Step9ConfirmView(View):
             if needs_question_step:
                 return redirect("apply_step6", app_id=current.application_id)
             try:
-                validate_custom_question_snapshot(snapshot, require_answers=True)
+                if current.profile_workflow_version == 1:
+                    validate_structured_application_answers(current, using=using)
+                else:
+                    validate_custom_question_snapshot(snapshot, require_answers=True)
             except ValueError as exc:
                 form.add_error(None, str(exc))
                 return self._render(request, current, form, custom_snapshot=snapshot)
@@ -2132,6 +2309,11 @@ class Step9ConfirmView(View):
 
     @staticmethod
     def _confirmation_snapshot(application):
+        if application.profile_workflow_version == 1:
+            snapshot = structured_question_snapshot(application)
+            if snapshot is None:
+                return [], True
+            return snapshot, False
         data = application.data
         if not isinstance(data, dict):
             raise ValueError("Application answer data is malformed.")
@@ -2157,6 +2339,13 @@ class Step9ConfirmView(View):
     def _render(self, request, application, form, custom_snapshot=None):
         data = application.data if isinstance(application.data, dict) else {}
         custom_snapshot_error = None
+        step6_data = data.get("step6-experience") or {}
+        if application.profile_workflow_version == 1:
+            try:
+                step6_data = structured_fixed_experience_answers(application)
+            except ValueError as exc:
+                step6_data = {}
+                custom_snapshot_error = str(exc)
         if custom_snapshot is None:
             try:
                 custom_snapshot, needs_question_step = self._confirmation_snapshot(
@@ -2178,7 +2367,7 @@ class Step9ConfirmView(View):
                 "application": application,
                 "form": form,
                 "step5_data": data.get("step5-student") or {},
-                "step6_data": data.get("step6-experience") or {},
+                "step6_data": step6_data,
                 "step6_custom_data": custom_snapshot,
                 "custom_snapshot_error": custom_snapshot_error,
                 "step7_data": data.get("step7-primaryparent") or {},

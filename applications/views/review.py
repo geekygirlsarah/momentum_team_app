@@ -35,15 +35,28 @@ from programs.constants import (
     STATE_CHOICES,
     TSHIRT_SIZE_CHOICES,
 )
-from programs.models import Adult, Program, ProgramDocument, RaceEthnicity, Student
+from programs.models import (
+    Adult,
+    Program,
+    ProgramDocument,
+    RaceEthnicity,
+    School,
+    Student,
+)
 from programs.permission_views import user_is_lead_mentor
 from programs.utils import GroupedProgramChoiceField
 from programs.utils.email_async import send_messages_in_background
 from programs.utils.email_html import build_email_parts
+from programs.utils.grades import calculate_graduation_year
 from programs.utils.notifications import get_sender_connection
 
 from ..answers import EXPERIENCE_QUESTIONS, extract_experience_answers
-from ..forms import StaffDocumentUploadForm
+from ..forms import (
+    NOT_LISTED_SCHOOL,
+    ParentInfoForm,
+    StaffDocumentUploadForm,
+    StudentInfoForm,
+)
 from ..models import (
     Application,
     ApplicationDocumentSubmission,
@@ -54,6 +67,7 @@ from ..models import (
     ApplicationQuestionSet,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
     normalize_step_keys,
 )
 from ..proposals import (
@@ -1291,6 +1305,11 @@ class ApplicationReviewDetailView(_ReviewerRequiredMixin, View):
                 "workflow_secondary_guardian": workflow_secondary_guardian,
                 "workflow_student_draft": workflow_student_draft,
                 "workflow_guardian_drafts": workflow_guardian_drafts,
+                "can_edit_typed_profile_drafts": (
+                    application.profile_workflow_version == 1
+                    and application.status == Application.Status.SUBMITTED
+                    and workflow_student_draft is not None
+                ),
                 "workflow_fixed_answers": workflow_fixed_answers,
                 "workflow_question_sets": workflow_question_sets,
             },
@@ -1873,6 +1892,748 @@ def _typed_answer_state_version(application, fixed_answers, question_sets, answe
     return salted_hmac(
         "applications.typed_answer_state", serialized, algorithm="sha1"
     ).hexdigest()
+
+
+def _nullable_bool_value(value):
+    if value is None:
+        return ""
+    return "true" if value else "false"
+
+
+def _coerce_nullable_bool(value):
+    return {"true": True, "false": False}.get(value)
+
+
+def _nullable_bool_editor_field(label, initial):
+    return forms.TypedChoiceField(
+        label=label,
+        choices=(
+            ("", "No answer"),
+            ("true", "Yes"),
+            ("false", "No"),
+        ),
+        coerce=_coerce_nullable_bool,
+        empty_value=None,
+        initial=_nullable_bool_value(initial),
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+
+
+def _typed_profile_drafts(application, *, lock=False):
+    using = application._state.db or "default"
+    student_query = ApplicationStudentDraft._base_manager.using(using).filter(
+        application_id=application.pk
+    )
+    guardian_query = ApplicationGuardianDraft._base_manager.using(using).filter(
+        application_id=application.pk
+    )
+    if lock:
+        student_query = student_query.select_for_update()
+        guardian_query = guardian_query.select_for_update()
+    student_drafts = list(student_query.order_by("pk"))
+    guardian_drafts = list(guardian_query.order_by("slot", "pk"))
+    if (
+        len(student_drafts) != 1
+        or student_drafts[0].organization_id != application.organization_id
+    ):
+        raise Http404
+    if any(
+        draft.organization_id != application.organization_id
+        or draft.slot not in ApplicationGuardianDraft.Slot.values
+        or draft.presence not in ApplicationGuardianDraft.Presence.values
+        for draft in guardian_drafts
+    ) or len({draft.slot for draft in guardian_drafts}) != len(guardian_drafts):
+        raise Http404
+
+    student_draft = student_drafts[0]
+    race_links_query = (
+        ApplicationStudentDraftRaceEthnicity._base_manager.using(using)
+        .filter(student_draft_id=student_draft.pk)
+        .order_by("pk")
+    )
+    if lock:
+        race_links_query = race_links_query.select_for_update()
+    race_links = list(race_links_query)
+    if any(link.organization_id != application.organization_id for link in race_links):
+        raise Http404
+    race_ids = [link.race_ethnicity_id for link in race_links]
+    race_query = RaceEthnicity._base_manager.using(using).filter(pk__in=race_ids)
+    if lock:
+        race_query = race_query.select_for_update()
+    races_by_id = {race.pk: race for race in race_query}
+    if any(
+        race_id not in races_by_id
+        or races_by_id[race_id].organization_id != application.organization_id
+        for race_id in race_ids
+    ):
+        raise Http404
+    return student_draft, guardian_drafts, race_links, races_by_id
+
+
+def _typed_profile_proposals(application, *, lock=False):
+    using = application._state.db or "default"
+    identity_query = (
+        ApplicationIdentityProposal._base_manager.using(using)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+    )
+    relationship_query = (
+        ApplicationRelationshipProposal._base_manager.using(using)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+    )
+    if lock:
+        identity_query = identity_query.select_for_update()
+        relationship_query = relationship_query.select_for_update()
+    identity_proposals = list(identity_query)
+    relationship_proposals = list(relationship_query)
+    if any(
+        proposal.organization_id != application.organization_id
+        for proposal in [*identity_proposals, *relationship_proposals]
+    ):
+        raise Http404
+    return identity_proposals, relationship_proposals
+
+
+def _typed_profile_state_version(
+    application,
+    student_draft,
+    guardian_drafts,
+    race_links,
+    identity_proposals,
+    relationship_proposals,
+):
+    def record_state(record):
+        values = []
+        for field in record._meta.concrete_fields:
+            value = getattr(record, field.attname)
+            if hasattr(value, "isoformat"):
+                value = value.isoformat()
+            values.append([field.attname, value])
+        return values
+
+    state = {
+        "application": [
+            application.pk,
+            application.organization_id,
+            application.profile_workflow_version,
+            application.program_id,
+            application.status,
+            application.updated_at.isoformat() if application.updated_at else None,
+        ],
+        "student": record_state(student_draft),
+        "guardians": [record_state(draft) for draft in guardian_drafts],
+        "race_ids": sorted(link.race_ethnicity_id for link in race_links),
+        "identity_proposals": [
+            record_state(proposal) for proposal in identity_proposals
+        ],
+        "relationship_proposals": [
+            record_state(proposal) for proposal in relationship_proposals
+        ],
+    }
+    serialized = json.dumps(state, sort_keys=True, separators=(",", ":"))
+    return salted_hmac(
+        "applications.typed_profile_draft_state", serialized, algorithm="sha1"
+    ).hexdigest()
+
+
+def _typed_profile_editor_forms(
+    request,
+    application,
+    student_draft,
+    guardian_drafts,
+    races_by_id,
+):
+    data = request.POST if request.method == "POST" else None
+    using = application._state.db or "default"
+    program = application.program if application.program_id else None
+    student_initial = {
+        "legal_first_name": student_draft.legal_first_name,
+        "preferred_first_name": student_draft.preferred_first_name,
+        "last_name": student_draft.last_name,
+        "pronouns": student_draft.pronouns,
+        "date_of_birth": student_draft.date_of_birth,
+        "address": student_draft.address,
+        "city": student_draft.city,
+        "state": student_draft.state,
+        "zip_code": student_draft.zip_code,
+        "personal_email": student_draft.personal_email,
+        "phone_number": student_draft.phone_number,
+        "phone_type": student_draft.phone_type,
+        "school_name": (
+            NOT_LISTED_SCHOOL
+            if student_draft.school_not_listed
+            else student_draft.school_name
+        ),
+        "grade": student_draft.grade,
+        "graduation_year": student_draft.graduation_year,
+        "tshirt_size": student_draft.tshirt_size,
+        "allergies": student_draft.allergies,
+        "dietary_restrictions": student_draft.dietary_restrictions,
+        "medical_notes": student_draft.medical_notes,
+        "race_ethnicities": list(races_by_id),
+    }
+    nullable_student_fields = {
+        "confirm_age": "Confirm date of birth",
+        "can_receive_texts": "Can receive texts?",
+        "directory_consent": "Directory consent",
+        "confirm_grade": "Confirm grade",
+        "allergies_answered": "Allergies answered",
+        "dietary_restrictions_answered": "Dietary restrictions answered",
+        "medical_notes_answered": "Medical notes answered",
+    }
+    for field_name in nullable_student_fields:
+        student_initial[field_name] = _nullable_bool_value(
+            getattr(student_draft, field_name)
+        )
+
+    student_form = StudentInfoForm(
+        data=data,
+        initial=student_initial,
+        program_start_date=program.start_date if program else None,
+        tshirt_enabled=bool(program and program.has_feature("tshirt-size")),
+        prefix="student",
+    )
+    for field_name, label in nullable_student_fields.items():
+        student_form.fields[field_name] = _nullable_bool_editor_field(
+            label, getattr(student_draft, field_name)
+        )
+    graduation_year_min = student_form.fields["graduation_year"].min_value
+    if student_draft.graduation_year is not None and graduation_year_min is not None:
+        graduation_year_min = min(graduation_year_min, student_draft.graduation_year)
+        student_form.fields["graduation_year"].min_value = graduation_year_min
+        for validator in student_form.fields["graduation_year"].validators:
+            if getattr(validator, "code", None) == "min_value":
+                validator.limit_value = graduation_year_min
+    student_form.fields["school_name"].choices = [
+        ("", "---"),
+        *[
+            (school.name, school.name)
+            for school in School._base_manager.using(using)
+            .filter(organization_id=application.organization_id)
+            .order_by("name")
+        ],
+        (NOT_LISTED_SCHOOL, "My school isn't listed"),
+    ]
+    current_school = student_initial["school_name"]
+    if (
+        current_school
+        and current_school != NOT_LISTED_SCHOOL
+        and not any(
+            value == current_school
+            for value, _label in student_form.fields["school_name"].choices
+        )
+    ):
+        student_form.fields["school_name"].choices.insert(
+            1, (current_school, current_school)
+        )
+    student_form.fields["race_ethnicities"].queryset = (
+        RaceEthnicity._base_manager.using(using)
+        .filter(organization_id=application.organization_id)
+        .order_by("name")
+    )
+
+    guardian_by_slot = {draft.slot: draft for draft in guardian_drafts}
+    guardian_forms = []
+    for slot in (
+        ApplicationGuardianDraft.Slot.PRIMARY,
+        ApplicationGuardianDraft.Slot.SECONDARY,
+    ):
+        draft = guardian_by_slot.get(slot)
+        if draft is None or draft.presence != ApplicationGuardianDraft.Presence.PRESENT:
+            guardian_forms.append(
+                {
+                    "draft": draft,
+                    "slot": slot,
+                    "label": (
+                        "Primary guardian"
+                        if slot == ApplicationGuardianDraft.Slot.PRIMARY
+                        else "Secondary guardian"
+                    ),
+                    "form": None,
+                }
+            )
+            continue
+        form_initial = {
+            field_name: getattr(draft, field_name)
+            for field_name in (
+                "legal_first_name",
+                "preferred_first_name",
+                "last_name",
+                "pronouns",
+                "relationship_to_student",
+                "specific_relationship",
+                "email",
+                "address",
+                "city",
+                "state",
+                "zip_code",
+                "phone_number",
+                "phone_type",
+            )
+        }
+        form_initial["can_receive_texts"] = _nullable_bool_value(
+            draft.can_receive_texts
+        )
+        form_initial["email_updates"] = _nullable_bool_value(draft.email_updates)
+        guardian_form = ParentInfoForm(
+            data,
+            initial=form_initial,
+            require_email=False,
+            require_address=False,
+            student_emails=[],
+            other_parent_email=None,
+            prefix=f"guardian_{slot}",
+        )
+        guardian_form.fields["can_receive_texts"] = _nullable_bool_editor_field(
+            "Can receive texts?", draft.can_receive_texts
+        )
+        guardian_form.fields["email_updates"] = _nullable_bool_editor_field(
+            "Receive email updates", draft.email_updates
+        )
+        guardian_forms.append(
+            {
+                "draft": draft,
+                "slot": slot,
+                "label": (
+                    "Primary guardian"
+                    if slot == ApplicationGuardianDraft.Slot.PRIMARY
+                    else "Secondary guardian"
+                ),
+                "form": guardian_form,
+            }
+        )
+    return student_form, guardian_forms
+
+
+def _typed_profile_forms_valid(student_form, guardian_forms, application, program):
+    valid = student_form.is_valid()
+    for entry in guardian_forms:
+        if entry["form"] is not None:
+            valid = entry["form"].is_valid() and valid
+    if not valid:
+        return False
+
+    dob = student_form.cleaned_data["date_of_birth"]
+    today = timezone.localdate()
+    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+    if age < 5 or age == 18:
+        if student_form.cleaned_data.get("confirm_age") is not True:
+            student_form.add_error(
+                "confirm_age",
+                "Confirm that this birthdate is correct before saving the application details.",
+            )
+            valid = False
+
+    if (
+        program
+        and program.grade_range_start is not None
+        and program.grade_range_end is not None
+    ):
+        grade = int(student_form.cleaned_data["grade"])
+        if not program.grade_range_start <= grade <= program.grade_range_end:
+            if student_form.cleaned_data.get("confirm_grade") is not True:
+                student_form.add_error(
+                    "confirm_grade",
+                    "Confirm that this grade is correct before saving the application details.",
+                )
+                valid = False
+    return valid
+
+
+def _typed_profile_emails_valid(student_form, guardian_forms, student_draft):
+    entries = [
+        (
+            student_form,
+            "personal_email",
+            student_draft.personal_email,
+            student_form.cleaned_data.get("personal_email", ""),
+        )
+    ]
+    for entry in guardian_forms:
+        if entry["form"] is None:
+            continue
+        form = entry["form"]
+        entries.append(
+            (
+                form,
+                "email",
+                entry["draft"].email,
+                form.cleaned_data.get("email", ""),
+            )
+        )
+
+    def normalized(email):
+        return email.strip().lower() if isinstance(email, str) else ""
+
+    valid = True
+    for index, (left_form, left_field, left_old, left_new) in enumerate(entries):
+        left_key = normalized(left_new)
+        if not left_key:
+            continue
+        for right_form, right_field, right_old, right_new in entries[index + 1 :]:
+            if left_key != normalized(right_new):
+                continue
+            if normalized(left_old) == left_key and normalized(right_old) == left_key:
+                continue
+            message = "Student and guardian contact emails must be different."
+            left_form.add_error(left_field, message)
+            right_form.add_error(right_field, message)
+            valid = False
+    return valid
+
+
+def _save_typed_profile_form(draft, cleaned_data, using):
+    values = {
+        "legal_first_name": cleaned_data["legal_first_name"],
+        "preferred_first_name": cleaned_data.get("preferred_first_name", ""),
+        "last_name": cleaned_data["last_name"],
+        "pronouns": cleaned_data.get("pronouns", ""),
+        "address": cleaned_data.get("address", ""),
+        "city": cleaned_data.get("city", ""),
+        "state": cleaned_data.get("state", ""),
+        "zip_code": cleaned_data.get("zip_code", ""),
+        "phone_number": cleaned_data.get("phone_number", ""),
+        "phone_type": cleaned_data.get("phone_type", ""),
+        "can_receive_texts": cleaned_data.get("can_receive_texts"),
+    }
+    if isinstance(draft, ApplicationStudentDraft):
+        school_name = cleaned_data["school_name"]
+        not_listed = school_name == NOT_LISTED_SCHOOL
+        grade = int(cleaned_data["grade"])
+        program_start = (
+            draft.application.program.start_date
+            if draft.application.program_id
+            else None
+        )
+        values.update(
+            {
+                "date_of_birth": cleaned_data["date_of_birth"],
+                "confirm_age": cleaned_data.get("confirm_age"),
+                "personal_email": cleaned_data.get("personal_email", ""),
+                "directory_consent": cleaned_data.get("directory_consent"),
+                "school_name": "" if not_listed else school_name,
+                "school_not_listed": not_listed,
+                "grade": grade,
+                "confirm_grade": cleaned_data.get("confirm_grade"),
+                "graduation_year": cleaned_data.get("graduation_year")
+                or calculate_graduation_year(grade, program_start),
+                "tshirt_size": cleaned_data.get("tshirt_size", draft.tshirt_size),
+                "allergies": cleaned_data.get("allergies", ""),
+                "dietary_restrictions": cleaned_data.get("dietary_restrictions", ""),
+                "medical_notes": cleaned_data.get("medical_notes", ""),
+                "allergies_answered": cleaned_data.get("allergies_answered"),
+                "dietary_restrictions_answered": cleaned_data.get(
+                    "dietary_restrictions_answered"
+                ),
+                "medical_notes_answered": cleaned_data.get("medical_notes_answered"),
+            }
+        )
+    else:
+        values.update(
+            {
+                "relationship_to_student": cleaned_data["relationship_to_student"],
+                "specific_relationship": cleaned_data.get("specific_relationship", ""),
+                "email": cleaned_data.get("email", ""),
+                "email_updates": cleaned_data.get("email_updates"),
+            }
+        )
+    for field_name, value in values.items():
+        if value == "" and getattr(draft, field_name) is None:
+            values[field_name] = None
+    changed_fields = [
+        field_name
+        for field_name, value in values.items()
+        if getattr(draft, field_name) != value
+    ]
+    if changed_fields:
+        for field_name in changed_fields:
+            setattr(draft, field_name, values[field_name])
+        draft.save(using=using, update_fields=changed_fields)
+    return changed_fields
+
+
+class ApplicationTypedProfileDraftEditView(_ReviewerRequiredMixin, View):
+    template_name = "applications/review/edit_typed_profile_drafts.html"
+
+    def _get_application(self, request, app_id):
+        application = _get_tenant_application(request, app_id)
+        if application.profile_workflow_version != 1:
+            raise Http404
+        if application.status != Application.Status.SUBMITTED:
+            messages.error(
+                request,
+                "Typed application details can only be edited while the application awaits review.",
+            )
+            return None
+        return application
+
+    def _render(
+        self, request, application, student_draft, guardian_drafts, races_by_id, version
+    ):
+        student_form, guardian_forms = _typed_profile_editor_forms(
+            request, application, student_draft, guardian_drafts, races_by_id
+        )
+        return render(
+            request,
+            self.template_name,
+            {
+                "application": application,
+                "student_form": student_form,
+                "guardian_forms": guardian_forms,
+                "state_version": version,
+                "student_draft": student_draft,
+            },
+        )
+
+    def get(self, request, app_id):
+        application = self._get_application(request, app_id)
+        if application is None:
+            return _proposal_review_redirect(_get_tenant_application(request, app_id))
+        identity_proposals, relationship_proposals = _typed_profile_proposals(
+            application
+        )
+        student_draft, guardian_drafts, race_links, races_by_id = _typed_profile_drafts(
+            application
+        )
+        version = _typed_profile_state_version(
+            application,
+            student_draft,
+            guardian_drafts,
+            race_links,
+            identity_proposals,
+            relationship_proposals,
+        )
+        return self._render(
+            request, application, student_draft, guardian_drafts, races_by_id, version
+        )
+
+    @transaction.atomic
+    def post(self, request, app_id):
+        application = _get_tenant_application(request, app_id)
+        using = application._state.db or "default"
+        current = _lock_review_application(request, app_id, using)
+        if current.profile_workflow_version != 1:
+            raise Http404
+        if current.status != Application.Status.SUBMITTED:
+            messages.error(
+                request,
+                "Typed application details can only be edited while the application awaits review.",
+            )
+            return _proposal_review_redirect(current)
+
+        identity_proposals, relationship_proposals = _typed_profile_proposals(
+            current, lock=True
+        )
+        student_draft, guardian_drafts, race_links, races_by_id = _typed_profile_drafts(
+            current, lock=True
+        )
+
+        version = _typed_profile_state_version(
+            current,
+            student_draft,
+            guardian_drafts,
+            race_links,
+            identity_proposals,
+            relationship_proposals,
+        )
+        student_form, guardian_forms = _typed_profile_editor_forms(
+            request, current, student_draft, guardian_drafts, races_by_id
+        )
+        forms_valid = _typed_profile_forms_valid(
+            student_form,
+            guardian_forms,
+            current,
+            current.program if current.program_id else None,
+        )
+        if forms_valid:
+            forms_valid = _typed_profile_emails_valid(
+                student_form, guardian_forms, student_draft
+            )
+        if not constant_time_compare(request.POST.get("state_version", ""), version):
+            student_form.add_error(
+                None,
+                "The application or its typed details changed after you opened this page. "
+                "Your entries remain here but were not saved; reload before trying again.",
+            )
+            return render(
+                request,
+                self.template_name,
+                {
+                    "application": current,
+                    "student_form": student_form,
+                    "guardian_forms": guardian_forms,
+                    "state_version": version,
+                    "student_draft": student_draft,
+                },
+            )
+        if not forms_valid:
+            return render(
+                request,
+                self.template_name,
+                {
+                    "application": current,
+                    "student_form": student_form,
+                    "guardian_forms": guardian_forms,
+                    "state_version": version,
+                    "student_draft": student_draft,
+                },
+            )
+        if any(not item.is_baseline_current() for item in identity_proposals):
+            student_form.add_error(
+                None,
+                "An identity review decision is stale. Resolve it before editing these details.",
+            )
+            return render(
+                request,
+                self.template_name,
+                {
+                    "application": current,
+                    "student_form": student_form,
+                    "guardian_forms": guardian_forms,
+                    "state_version": version,
+                    "student_draft": student_draft,
+                },
+            )
+        if any(not item.is_baseline_current() for item in relationship_proposals):
+            student_form.add_error(
+                None,
+                "A relationship review decision is stale. Resolve it before editing these details.",
+            )
+            return render(
+                request,
+                self.template_name,
+                {
+                    "application": current,
+                    "student_form": student_form,
+                    "guardian_forms": guardian_forms,
+                    "state_version": version,
+                    "student_draft": student_draft,
+                },
+            )
+
+        old_revisions = {
+            student_draft.pk: student_draft.revision,
+            **{draft.pk: draft.revision for draft in guardian_drafts},
+        }
+        student_changes = _save_typed_profile_form(
+            student_draft, student_form.cleaned_data, using
+        )
+        new_race_ids = set(
+            student_form.cleaned_data["race_ethnicities"].values_list("pk", flat=True)
+        )
+        old_race_ids = {link.race_ethnicity_id for link in race_links}
+        if new_race_ids != old_race_ids:
+            if not student_changes:
+                student_draft.save(using=using, update_fields=["school_name"])
+            ApplicationStudentDraftRaceEthnicity._base_manager.using(using).filter(
+                student_draft_id=student_draft.pk
+            ).delete()
+            for race_id in sorted(new_race_ids):
+                ApplicationStudentDraftRaceEthnicity.objects.using(using).create(
+                    organization_id=current.organization_id,
+                    student_draft=student_draft,
+                    race_ethnicity_id=race_id,
+                )
+
+        guardian_changes = []
+        guardian_by_pk = {draft.pk: draft for draft in guardian_drafts}
+        for entry in guardian_forms:
+            guardian_form = entry["form"]
+            if guardian_form is None:
+                continue
+            draft = guardian_by_pk[entry["draft"].pk]
+            changed = _save_typed_profile_form(draft, guardian_form.cleaned_data, using)
+            if changed:
+                guardian_changes.append(draft)
+
+        changed = bool(
+            student_changes or new_race_ids != old_race_ids or guardian_changes
+        )
+        if not changed:
+            messages.info(request, "No typed application details were changed.")
+            return _proposal_review_redirect(current)
+
+        current.save(using=using, update_fields=["updated_at"])
+        for proposal in identity_proposals:
+            proposal.match_state = ApplicationIdentityProposal.MatchState.AMBIGUOUS
+            proposal.candidate_student = None
+            proposal.candidate_adult = None
+            proposal.candidate_baseline_revision = None
+            proposal.target_student = None
+            proposal.target_adult = None
+            proposal.target_baseline_revision = None
+            proposal.decision = ApplicationIdentityProposal.Decision.PENDING
+            proposal.reviewed_by = None
+            proposal.reviewed_at = None
+            proposal.baseline_application_updated_at = current.updated_at
+            proposal.save(
+                using=using,
+                update_fields=[
+                    "match_state",
+                    "candidate_student",
+                    "candidate_adult",
+                    "candidate_baseline_revision",
+                    "target_student",
+                    "target_adult",
+                    "target_baseline_revision",
+                    "decision",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "baseline_application_updated_at",
+                    "updated_at",
+                ],
+            )
+        current_drafts = {student_draft.pk: student_draft, **guardian_by_pk}
+        for proposal in relationship_proposals:
+            proposal.decision = ApplicationRelationshipProposal.Decision.PENDING
+            proposal.reviewed_by = None
+            proposal.reviewed_at = None
+            proposal.baseline_application_updated_at = current.updated_at
+            if proposal.student_draft_id:
+                target = current_drafts.get(proposal.student_draft_id)
+                if target is None:
+                    raise Http404
+                proposal.baseline_student_draft_revision = target.revision
+            if proposal.guardian_draft_id:
+                target = current_drafts.get(proposal.guardian_draft_id)
+                if target is None:
+                    raise Http404
+                proposal.baseline_guardian_draft_revision = target.revision
+            proposal.save(
+                using=using,
+                update_fields=[
+                    "decision",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "baseline_application_updated_at",
+                    "baseline_student_draft_revision",
+                    "baseline_guardian_draft_revision",
+                    "updated_at",
+                ],
+            )
+
+        log_event(
+            request=request,
+            event=AuditEvent.CONTACT_INFO_UPDATED,
+            resource=current,
+            before={"draft_revisions": old_revisions},
+            after={
+                "draft_revisions": {
+                    student_draft.pk: student_draft.revision,
+                    **{draft.pk: draft.revision for draft in guardian_drafts},
+                },
+                "identity_proposals_reset": len(identity_proposals),
+                "relationship_proposals_reset": len(relationship_proposals),
+            },
+            notes="Typed application draft details updated; dependent review decisions were reset.",
+        )
+        messages.success(
+            request,
+            "Typed application details were saved. Identity and relationship proposals must be reviewed again.",
+        )
+        return _proposal_review_redirect(current)
 
 
 class ApplicationTypedAnswerEditView(_ReviewerRequiredMixin, View):

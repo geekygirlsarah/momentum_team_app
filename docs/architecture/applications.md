@@ -276,10 +276,16 @@ wizard still creates legacy version-0 applications, and conversion for those
 applications continues through its existing email-matching path. Profile-workflow
 finalization can copy typed draft values to incomplete profiles, but the public
 wizard does not yet create or update those profiles. This remains a foundation,
-not a user-visible rollout. The legacy staff editor is unavailable for
-profile-workflow applications because it writes JSON; the typed answer editor
-does not edit student or guardian profiles, and a safe typed profile editor is
-still required before enabling the new workflow.
+not an applicant-facing rollout. The JSON editor is unavailable for
+profile-workflow applications. Lead reviewers can use the typed draft editor
+while a version-1 application awaits review; it reuses student and guardian
+form validation, scopes school and race choices to the application organization,
+and checks a signed state version covering both draft rows and review proposals.
+Changed values update only application-owned drafts, advance their revisions,
+reset dependent identity and relationship decisions, and emit an audit event
+containing revision metadata rather than profile or medical values. It does not
+edit live profiles or relationships, and it does not connect the public wizard
+to the structured workflow.
 
 A question-set row is keyed by application and program; the row itself means
 the set was frozen, including when it has zero answer rows. Its ordered answers
@@ -292,18 +298,20 @@ application, program, and answer records share an organization; database
 uniqueness constraints enforce row cardinality, not cross-table tenant ownership
 or integrity for bulk operations that bypass model saves.
 
-The typed draft records are used by structured review and profile-workflow
-finalization, but are not connected to the public wizard, reminder and
-maintenance readers, or legacy conversion. `Application.data` remains
-authoritative for the live public workflow; there is no dual-write, backfill,
-historical normalization, or live-data migration, and profile-workflow creation
-is not enabled for applicants. Before typed records can replace JSON,
-each reader and writer must be migrated with application-row locking, stale
-conflict versions, staff/applicant audit coverage, and the approved per-person
-authorization and relationship-review rules. Legacy approved applications,
-protected documents, snapshot wording, fixed-answer conflicts, and historical
-audit snapshots must remain recoverable; any backfill or JSON removal needs a
-separately approved migration and recovery plan.
+Step 6 is connected to typed question and fixed-answer records for version-1
+profile-workflow applications: the question set is frozen before display,
+answers are written under the locked application row with a signed state
+version, and confirmation reads and revalidates the typed answers. Version-0
+applications continue to use their existing JSON path. Other wizard steps,
+reminder and maintenance readers, and legacy conversion are not yet migrated;
+profile-workflow creation is not enabled for applicants. Before typed records
+can replace JSON, each remaining reader and writer must be migrated with
+application-row locking, stale conflict versions, staff/applicant audit
+coverage, and the approved per-person authorization and relationship-review
+rules. Legacy approved applications, protected documents, snapshot wording,
+fixed-answer conflicts, and historical audit snapshots must remain recoverable;
+any backfill or JSON removal needs a separately approved migration and recovery
+plan.
 
 Conversion matches existing students and adults only within the application's
 organization and explicitly assigns that organization to new profiles,

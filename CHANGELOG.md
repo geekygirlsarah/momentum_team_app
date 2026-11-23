@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-11-23
+
+### Added
+- Lead Mentors can edit typed student and guardian draft details on submitted profile-workflow applications; edits are conflict-checked, audited without recording sensitive values, and reset dependent identity and relationship decisions for review.
+
 ## 2026-11-22
 
 ### Added
