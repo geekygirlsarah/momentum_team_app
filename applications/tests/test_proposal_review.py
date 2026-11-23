@@ -578,6 +578,255 @@ class ApplicationProposalReviewTests(TestCase):
         self.assertTrue(student.is_incomplete_application_profile)
         self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
 
+    def test_approval_waits_for_required_structured_answers(self):
+        student, guardian = self.add_new_profile_workflow()
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(answer=" ")
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Required custom application questions are unanswered."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_malformed_frozen_question_wording(self):
+        student, guardian = self.add_new_profile_workflow()
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(question_text=" ")
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Frozen application question answers are inconsistent."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_fixed_answer(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Fixed Answer Organization",
+            slug="foreign-fixed-answer",
+            subdomain="foreign-fixed-answer",
+        )
+        fixed = ApplicationFixedAnswer.objects.get(application=self.application)
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_question_set(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Question Set Organization",
+            slug="foreign-question-set",
+            subdomain="foreign-question-set",
+        )
+        question_set = ApplicationQuestionSet.objects.get(application=self.application)
+        ApplicationQuestionSet.objects.filter(pk=question_set.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_question_answer(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Question Answer Organization",
+            slug="foreign-question-answer",
+            subdomain="foreign-question-answer",
+        )
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_requires_active_question_snapshot(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionSet.objects.filter(application=self.application).delete()
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_accepts_frozen_empty_question_set(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionAnswer.objects.filter(
+            question_set__application=self.application
+        ).delete()
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertFalse(student.is_incomplete_application_profile)
+        self.assertFalse(guardian.is_incomplete_application_profile)
+        self.assertFalse(
+            StudentApplicationAnswer.objects.filter(
+                application=self.application, source_step="step6-custom"
+            ).exists()
+        )
+
+    def test_approval_accepts_blank_optional_question(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionAnswer.objects.filter(
+            question_set__application=self.application
+        ).update(is_required=False, answer="")
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertFalse(student.is_incomplete_application_profile)
+        self.assertFalse(guardian.is_incomplete_application_profile)
+
     def test_final_approval_activates_profiles_and_relationships_atomically(self):
         student, guardian = self.add_new_profile_workflow()
 
@@ -721,6 +970,11 @@ class ApplicationProposalReviewTests(TestCase):
                 "secondary_guardian_profile",
                 "updated_at",
             ]
+        )
+        ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
         )
         ApplicationStudentDraft.objects.create(
             organization=self.organization,

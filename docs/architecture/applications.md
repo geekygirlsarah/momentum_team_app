@@ -243,6 +243,13 @@ incomplete profiles, applies only approved relationship changes, enrolls the
 student, and preserves structured answers in one transaction. Profile-workflow
 applications cannot use the legacy conversion endpoint.
 
+Before finalization, the approval transaction locks fixed answers, frozen
+question sets, their question rows, and referenced programs, then validates their
+tenant ownership and program binding. The selected program must have exactly one
+frozen set; a frozen set with no questions is valid, while missing or malformed
+question wording and unanswered required questions block acceptance. These
+checks run before any profile, relationship, enrollment, or answer-copy writes.
+
 The read-only `evaluate_application_profile_edit` helper encodes the approved
 exact-linked-account, unique verified-email, and existing linked-guardian rules;
 edits to another guardian, ambiguous identities, or an unrelated student

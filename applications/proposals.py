@@ -14,7 +14,10 @@ from programs.models import (
     Student,
 )
 
-from .answers import save_structured_experience_answers
+from .answers import (
+    save_structured_experience_answers,
+    validate_structured_application_answers,
+)
 from .models import (
     Application,
     ApplicationGuardianDraft,
@@ -588,6 +591,11 @@ def finalize_profile_workflow_application(application, request, using=None):
         )
     if not application.program_id:
         return False, None, "A program is required before accepting this application."
+
+    try:
+        validate_structured_application_answers(application, using=using)
+    except ValueError as exc:
+        return False, None, str(exc)
 
     context = lock_application_proposal_context(application, using=using)
     resolved, reason = proposal_review_state(application)

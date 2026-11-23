@@ -11,6 +11,7 @@ from programs.models import Program
 from .models import (
     Application,
     ApplicationFixedAnswer,
+    ApplicationQuestionAnswer,
     ApplicationQuestionSet,
     ProgramApplicationQuestion,
     StudentApplicationAnswer,
@@ -401,3 +402,87 @@ def save_structured_experience_answers(application, student):
                 "answer": item.answer,
             },
         )
+
+
+def validate_structured_application_answers(application, using=None):
+    """Validate and lock typed answers before a profile-workflow application is accepted."""
+    database = using or application._state.db or "default"
+    fixed_answers = list(
+        ApplicationFixedAnswer._base_manager.using(database)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+        .select_for_update()
+    )
+    if any(
+        item.organization_id != application.organization_id
+        or not item.source_step
+        or not item.question_key
+        or (item.answer is not None and not isinstance(item.answer, str))
+        for item in fixed_answers
+    ):
+        raise ValueError("Fixed application answers are inconsistent.")
+
+    question_sets = list(
+        ApplicationQuestionSet._base_manager.using(database)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+        .select_for_update()
+    )
+    if any(
+        item.organization_id != application.organization_id for item in question_sets
+    ):
+        raise ValueError("Frozen application question sets are inconsistent.")
+    if not application.program_id:
+        raise ValueError("An application program is required for its question set.")
+
+    program_ids = {item.program_id for item in question_sets}
+    program_organizations = dict(
+        Program._base_manager.using(database)
+        .filter(pk__in=program_ids)
+        .select_for_update()
+        .values_list("pk", "organization_id")
+    )
+    if any(
+        program_organizations.get(item.program_id) != application.organization_id
+        for item in question_sets
+    ):
+        raise ValueError("A frozen question set references another organization.")
+
+    active_sets = [
+        item for item in question_sets if item.program_id == application.program_id
+    ]
+    if len(active_sets) != 1:
+        raise ValueError("A frozen question set is required for the selected program.")
+
+    answers = list(
+        ApplicationQuestionAnswer._base_manager.using(database)
+        .filter(question_set_id__in=[item.pk for item in question_sets])
+        .order_by("pk")
+        .select_for_update()
+    )
+    question_sets_by_id = {item.pk: item for item in question_sets}
+    seen_question_ids = set()
+    seen_positions = set()
+    for item in answers:
+        question_set = question_sets_by_id.get(item.question_set_id)
+        if (
+            question_set is None
+            or item.organization_id != application.organization_id
+            or not isinstance(item.question_text, str)
+            or not item.question_text.strip()
+            or (item.answer is not None and not isinstance(item.answer, str))
+            or type(item.is_required) is not bool
+        ):
+            raise ValueError("Frozen application question answers are inconsistent.")
+        question_key = (item.question_set_id, item.question_id)
+        position_key = (item.question_set_id, item.position)
+        if question_key in seen_question_ids or position_key in seen_positions:
+            raise ValueError("Frozen application question answers are duplicated.")
+        seen_question_ids.add(question_key)
+        seen_positions.add(position_key)
+        if (
+            question_set.program_id == application.program_id
+            and item.is_required
+            and (not item.answer or not item.answer.strip())
+        ):
+            raise ValueError("Required custom application questions are unanswered.")
