@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+from datetime import date
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from applications.models import (
     ApplicationQuestionSet,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
     StudentApplicationAnswer,
 )
 from applications.proposals import ApplicationFinalizationError
@@ -34,6 +36,8 @@ from programs.models import (
     Enrollment,
     Program,
     ProgramDocument,
+    RaceEthnicity,
+    School,
     Student,
     StudentDocument,
 )
@@ -98,7 +102,7 @@ class ApplicationProposalReviewTests(TestCase):
         defaults.update(overrides)
         return Application.objects.create(**defaults)
 
-    def profile(self, model, email, first_name):
+    def profile(self, model, email, first_name, **overrides):
         values = {
             "organization": self.organization,
             "personal_email": email,
@@ -108,6 +112,7 @@ class ApplicationProposalReviewTests(TestCase):
         }
         if model is Adult:
             values["is_parent"] = True
+        values.update(overrides)
         return model.all_objects.create(**values)
 
     def add_identity_decision(
@@ -132,31 +137,56 @@ class ApplicationProposalReviewTests(TestCase):
         )
 
     def add_new_profile_workflow(
-        self, include_required_document=True, required_form=True, existing_student=False
+        self,
+        include_required_document=True,
+        required_form=True,
+        existing_student=False,
+        student_draft_values=None,
+        guardian_draft_values=None,
+        student_profile_values=None,
+        guardian_profile_values=None,
     ):
-        student = self.profile(Student, "student@example.test", "Student")
+        student = self.profile(
+            Student,
+            "student@example.test",
+            "Student",
+            **(student_profile_values or {}),
+        )
         if existing_student:
             student.is_incomplete_application_profile = False
             student.save(update_fields=["is_incomplete_application_profile"])
-        guardian = self.profile(Adult, "guardian@example.test", "Guardian")
+        guardian = self.profile(
+            Adult,
+            "guardian@example.test",
+            "Guardian",
+            **(guardian_profile_values or {}),
+        )
         self.application.student_profile = student
         self.application.primary_guardian_profile = guardian
         self.application.save(
             update_fields=["student_profile", "primary_guardian_profile", "updated_at"]
         )
+        student_draft_fields = {
+            "legal_first_name": "Student",
+            "last_name": "Applicant",
+        }
+        student_draft_fields.update(student_draft_values or {})
         student_draft = ApplicationStudentDraft.objects.create(
             organization=self.organization,
             application=self.application,
-            legal_first_name="Student",
-            last_name="Applicant",
+            **student_draft_fields,
         )
+        guardian_draft_fields = {
+            "email": "guardian@example.test",
+            "relationship_to_student": "parent",
+        }
+        guardian_draft_fields.update(guardian_draft_values or {})
         guardian_draft = ApplicationGuardianDraft.objects.create(
             organization=self.organization,
             application=self.application,
             slot=ApplicationGuardianDraft.Slot.PRIMARY,
             presence=ApplicationGuardianDraft.Presence.PRESENT,
-            email="guardian@example.test",
-            relationship_to_student="parent",
+            **guardian_draft_fields,
         )
         self.add_identity_decision(ApplicationIdentityProposal.SubjectSlot.STUDENT)
         self.add_identity_decision(
@@ -658,12 +688,92 @@ class ApplicationProposalReviewTests(TestCase):
         self.assertEqual(self.application.status, Application.Status.SUBMITTED)
         self.assertTrue(student.is_incomplete_application_profile)
         self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(guardian.legal_first_name, "Guardian")
         self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
         self.assertFalse(
             AdultStudentRelationship.all_objects.filter(student=student).exists()
         )
         self.assertFalse(StudentDocument.objects.filter(student=student).exists())
         notice.assert_not_called()
+
+    def test_approval_rejects_duplicate_typed_student_and_guardian_emails(self):
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={
+                "legal_first_name": "Typed Student",
+                "personal_email": "guardian@example.test",
+            },
+            student_profile_values={
+                "personal_email": "placeholder-student@example.test",
+            },
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student and guardian emails must be distinct before acceptance."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(student.personal_email, "placeholder-student@example.test")
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+
+    def test_approval_rejects_foreign_race_ethnicity_on_student_draft(self):
+        student, guardian = self.add_new_profile_workflow()
+        draft = ApplicationStudentDraft.objects.get(application=self.application)
+        local_race = RaceEthnicity.objects.create(
+            organization=self.organization,
+            key="local-race",
+            name="Local race",
+        )
+        link = ApplicationStudentDraftRaceEthnicity.objects.create(
+            organization=self.organization,
+            student_draft=draft,
+            race_ethnicity=local_race,
+        )
+        foreign_organization = Organization.objects.create(
+            name="Foreign Race Organization",
+            slug="foreign-race-review",
+            subdomain="foreign-race-review",
+        )
+        foreign_race = RaceEthnicity.objects.create(
+            organization=foreign_organization,
+            key="foreign-race",
+            name="Foreign race",
+        )
+        ApplicationStudentDraftRaceEthnicity.objects.filter(pk=link.pk).update(
+            race_ethnicity=foreign_race
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student race and ethnicity selections are inconsistent."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
 
     def test_foreign_document_submission_blocks_profile_finalization(self):
         student, guardian = self.add_new_profile_workflow()
@@ -986,7 +1096,62 @@ class ApplicationProposalReviewTests(TestCase):
         self.assertFalse(guardian.is_incomplete_application_profile)
 
     def test_final_approval_activates_profiles_and_relationships_atomically(self):
-        student, guardian = self.add_new_profile_workflow()
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={
+                "legal_first_name": "Typed Student",
+                "preferred_first_name": "Sparky",
+                "date_of_birth": date(2010, 5, 4),
+                "address": "123 Robot Way",
+                "school_name": "Typed High School",
+                "state": "OH",
+                "zip_code": "15213",
+                "personal_email": "student@example.test",
+                "phone_number": "412-555-0111",
+                "phone_type": "cell",
+                "can_receive_texts": False,
+                "directory_consent": False,
+                "graduation_year": 2028,
+                "tshirt_size": "M",
+                "allergies": "Peanuts",
+                "allergies_answered": True,
+            },
+            guardian_draft_values={
+                "legal_first_name": "Typed Guardian",
+                "email": "guardian@example.test",
+                "address": "456 Guardian Way",
+                "state": "OH",
+                "zip_code": "15213",
+                "phone_number": "412-555-0222",
+                "phone_type": "cell",
+                "can_receive_texts": False,
+                "email_updates": False,
+            },
+            student_profile_values={
+                "personal_email": "placeholder-student@example.test",
+                "can_receive_texts": True,
+                "directory_consent": True,
+                "city": "Retained Student City",
+            },
+            guardian_profile_values={
+                "personal_email": "placeholder-guardian@example.test",
+                "can_receive_texts": True,
+                "email_updates": True,
+                "city": "Retained Guardian City",
+            },
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        race_ethnicity = RaceEthnicity.objects.create(
+            organization=self.organization,
+            key="asian",
+            name="Asian",
+        )
+        ApplicationStudentDraftRaceEthnicity.objects.create(
+            organization=self.organization,
+            student_draft=student_draft,
+            race_ethnicity=race_ethnicity,
+        )
 
         with patch("applications.views.review.send_application_approved_email"):
             response = self.client.post(
@@ -1010,6 +1175,33 @@ class ApplicationProposalReviewTests(TestCase):
         )
         self.assertFalse(student.is_incomplete_application_profile)
         self.assertFalse(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Typed Student")
+        self.assertEqual(student.preferred_first_name, "Sparky")
+        self.assertEqual(student.date_of_birth, date(2010, 5, 4))
+        self.assertEqual(student.address, "123 Robot Way")
+        self.assertEqual(student.state, "OH")
+        self.assertEqual(student.zip_code, "15213")
+        self.assertEqual(student.personal_email, "student@example.test")
+        self.assertEqual(student.phone_number, "412-555-0111")
+        self.assertFalse(student.can_receive_texts)
+        self.assertFalse(student.directory_consent)
+        self.assertEqual(student.graduation_year, 2028)
+        self.assertEqual(student.tshirt_size, "M")
+        self.assertEqual(student.allergies, "Peanuts")
+        self.assertEqual(student.city, "Retained Student City")
+        self.assertEqual(student.school.name, "Typed High School")
+        self.assertQuerySetEqual(
+            student.race_ethnicities.order_by("pk"), [race_ethnicity]
+        )
+        self.assertEqual(guardian.legal_first_name, "Typed Guardian")
+        self.assertEqual(guardian.personal_email, "guardian@example.test")
+        self.assertEqual(guardian.address, "456 Guardian Way")
+        self.assertEqual(guardian.state, "OH")
+        self.assertEqual(guardian.zip_code, "15213")
+        self.assertEqual(guardian.phone_number, "412-555-0222")
+        self.assertFalse(guardian.can_receive_texts)
+        self.assertFalse(guardian.email_updates)
+        self.assertEqual(guardian.city, "Retained Guardian City")
         self.assertTrue(
             AdultStudentRelationship.objects.filter(
                 student=student, adult=guardian
@@ -1040,6 +1232,105 @@ class ApplicationProposalReviewTests(TestCase):
         )
         self.assertEqual(custom_answer.question_text, "What will you build?")
         self.assertEqual(custom_answer.answer, "A small rover.")
+
+    def test_existing_confirmed_student_is_not_overwritten_from_draft(self):
+        student, guardian = self.add_new_profile_workflow(
+            existing_student=True,
+            student_draft_values={
+                "legal_first_name": "Unapproved Student Name",
+                "personal_email": "changed-student@example.test",
+            },
+            student_profile_values={
+                "legal_first_name": "Established Student",
+                "personal_email": "student@example.test",
+            },
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        identity.candidate_student = student
+        identity.target_student = student
+        identity.match_state = ApplicationIdentityProposal.MatchState.UNIQUE
+        identity.candidate_baseline_revision = student.profile_revision
+        identity.target_baseline_revision = student.profile_revision
+        identity.decision = ApplicationIdentityProposal.Decision.CONFIRMED
+        identity.reviewed_by = self.reviewer
+        identity.reviewed_at = timezone.now()
+        identity.save()
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertEqual(student.legal_first_name, "Established Student")
+        self.assertEqual(student.personal_email, "student@example.test")
+
+    def test_final_approval_rejects_conflicting_typed_email_claims(self):
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={"personal_email": "guardian@example.test"},
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.personal_email, "student@example.test")
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_stale_typed_draft_prevents_final_approval(self):
+        student, guardian = self.add_new_profile_workflow(
+            include_required_document=False,
+        )
+        draft = ApplicationStudentDraft.objects.get(application=self.application)
+        draft.legal_first_name = "Changed after review"
+        draft.save(update_fields=["legal_first_name"])
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        notice.assert_not_called()
 
     def test_late_finalization_conflict_rolls_back_all_profile_and_relationship_changes(
         self,

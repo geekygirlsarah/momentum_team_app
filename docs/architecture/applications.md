@@ -243,6 +243,16 @@ incomplete profiles, applies only approved relationship changes, enrolls the
 student, and preserves structured answers in one transaction. Profile-workflow
 applications cannot use the legacy conversion endpoint.
 
+For profile-workflow approval, validated typed student and guardian draft
+fields are copied only to linked incomplete profiles in the finalization
+transaction. Null draft values do not erase profile values, while explicit false
+preferences are retained. The finalizer also validates tenant ownership of
+race/ethnicity selections, resolves a submitted school name within the
+application organization, and rejects email conflicts involving an incomplete
+profile. Typed draft values never overwrite confirmed existing profiles. This
+email check does not serialize writers in unrelated profile workflows, so it is
+not a portal-wide uniqueness guarantee and does not unblock the public wizard.
+
 Before finalization, the approval transaction locks fixed answers, frozen
 question sets, their question rows, and referenced programs, then validates their
 tenant ownership and program binding. The selected program must have exactly one
@@ -263,10 +273,13 @@ exact-linked-account, unique verified-email, and existing linked-guardian rules;
 edits to another guardian, ambiguous identities, or an unrelated student
 require lead review. It is not connected to applicant profile writes. The public
 wizard still creates legacy version-0 applications, and conversion for those
-applications continues through its existing email-matching path. This remains a
-foundation, not a user-visible rollout. The legacy staff editor is unavailable
-for profile-workflow applications because it writes JSON rather than structured
-records; a safe typed editor is required before enabling the new workflow.
+applications continues through its existing email-matching path. Profile-workflow
+finalization can copy typed draft values to incomplete profiles, but the public
+wizard does not yet create or update those profiles. This remains a foundation,
+not a user-visible rollout. The legacy staff editor is unavailable for
+profile-workflow applications because it writes JSON; the typed answer editor
+does not edit student or guardian profiles, and a safe typed profile editor is
+still required before enabling the new workflow.
 
 A question-set row is keyed by application and program; the row itself means
 the set was frozen, including when it has zero answer rows. Its ordered answers
@@ -279,10 +292,12 @@ application, program, and answer records share an organization; database
 uniqueness constraints enforce row cardinality, not cross-table tenant ownership
 or integrity for bulk operations that bypass model saves.
 
-This foundation is not connected to the wizard, review, conversion, reminders,
-or maintenance commands. `Application.data` remains authoritative; there is no
-dual-write, backfill, historical normalization, live-data migration, profile
-activation, or user-visible rollout. Before typed records can replace JSON,
+The typed draft records are used by structured review and profile-workflow
+finalization, but are not connected to the public wizard, reminder and
+maintenance readers, or legacy conversion. `Application.data` remains
+authoritative for the live public workflow; there is no dual-write, backfill,
+historical normalization, or live-data migration, and profile-workflow creation
+is not enabled for applicants. Before typed records can replace JSON,
 each reader and writer must be migrated with application-row locking, stale
 conflict versions, staff/applicant audit coverage, and the approved per-person
 authorization and relationship-review rules. Legacy approved applications,
