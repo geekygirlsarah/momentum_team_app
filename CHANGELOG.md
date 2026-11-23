@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Lead Mentors can edit typed student and guardian draft details on submitted profile-workflow applications; edits are conflict-checked, audited without recording sensitive values, and reset dependent identity and relationship decisions for review.
+- Student and guardian details entered during a profile-workflow application now save directly to an isolated draft profile as each step is completed, instead of being merged in later from JSON. A uniquely identified returning student's or guardian's authorized edits apply immediately to their existing profile; a new person, an ambiguous match, or another guardian's details wait for lead review before anything changes.
+- Deleting an application — whether an applicant withdraws it, a reviewer removes it, or it expires after 30 days unfinished — now also removes any new draft student or guardian profile it created for review, as long as that profile is still unused and not referenced by another application, so an abandoned application can no longer permanently occupy a family's email.
+- Missing-document reminders now also reach a guardian linked through a profile-workflow application's draft, not only one found in the legacy application data.
 
 ## 2026-11-22
 

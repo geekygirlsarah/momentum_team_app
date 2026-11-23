@@ -479,6 +479,52 @@ def _draft_profile_fields(draft, field_map):
     }
 
 
+#: ApplicationStudentDraft field name -> Student field name. Shared with
+#: ``applications.identity_sync``, which applies the same mapping for an
+#: immediate, pre-review edit to an authorized existing (non-incomplete)
+#: profile; finalization below only ever touches a profile that is still
+#: incomplete, so the two call sites never fight over the same write.
+STUDENT_DRAFT_PROFILE_FIELD_MAP = {
+    "legal_first_name": "legal_first_name",
+    "preferred_first_name": "preferred_first_name",
+    "last_name": "last_name",
+    "pronouns": "pronouns",
+    "date_of_birth": "date_of_birth",
+    "address": "address",
+    "city": "city",
+    "state": "state",
+    "zip_code": "zip_code",
+    "personal_email": "personal_email",
+    "phone_number": "phone_number",
+    "phone_type": "phone_type",
+    "can_receive_texts": "can_receive_texts",
+    "directory_consent": "directory_consent",
+    "graduation_year": "graduation_year",
+    "tshirt_size": "tshirt_size",
+    "allergies": "allergies",
+    "dietary_restrictions": "dietary_restrictions",
+    "medical_notes": "medical_notes",
+}
+
+#: ApplicationGuardianDraft field name -> Adult field name. See
+#: ``STUDENT_DRAFT_PROFILE_FIELD_MAP`` above.
+GUARDIAN_DRAFT_PROFILE_FIELD_MAP = {
+    "legal_first_name": "legal_first_name",
+    "preferred_first_name": "preferred_first_name",
+    "last_name": "last_name",
+    "pronouns": "pronouns",
+    "email": "personal_email",
+    "address": "address",
+    "city": "city",
+    "state": "state",
+    "zip_code": "zip_code",
+    "phone_number": "phone_number",
+    "phone_type": "phone_type",
+    "can_receive_texts": "can_receive_texts",
+    "email_updates": "email_updates",
+}
+
+
 def _student_draft_race_ethnicity_ids(application, draft, using):
     links = list(
         ApplicationStudentDraftRaceEthnicity._base_manager.using(using)
@@ -513,42 +559,6 @@ def _student_draft_race_ethnicity_ids(application, draft, using):
 def _prepare_incomplete_profile_updates(
     application, context, student, primary_guardian, secondary_guardian, using
 ):
-    student_fields = {
-        "legal_first_name": "legal_first_name",
-        "preferred_first_name": "preferred_first_name",
-        "last_name": "last_name",
-        "pronouns": "pronouns",
-        "date_of_birth": "date_of_birth",
-        "address": "address",
-        "city": "city",
-        "state": "state",
-        "zip_code": "zip_code",
-        "personal_email": "personal_email",
-        "phone_number": "phone_number",
-        "phone_type": "phone_type",
-        "can_receive_texts": "can_receive_texts",
-        "directory_consent": "directory_consent",
-        "graduation_year": "graduation_year",
-        "tshirt_size": "tshirt_size",
-        "allergies": "allergies",
-        "dietary_restrictions": "dietary_restrictions",
-        "medical_notes": "medical_notes",
-    }
-    guardian_fields = {
-        "legal_first_name": "legal_first_name",
-        "preferred_first_name": "preferred_first_name",
-        "last_name": "last_name",
-        "pronouns": "pronouns",
-        "email": "personal_email",
-        "address": "address",
-        "city": "city",
-        "state": "state",
-        "zip_code": "zip_code",
-        "phone_number": "phone_number",
-        "phone_type": "phone_type",
-        "can_receive_texts": "can_receive_texts",
-        "email_updates": "email_updates",
-    }
     prepared = {}
 
     if student.is_incomplete_application_profile:
@@ -565,7 +575,7 @@ def _prepare_incomplete_profile_updates(
             raise ApplicationFinalizationError(
                 "The student application draft belongs to another organization."
             )
-        fields = _draft_profile_fields(draft, student_fields)
+        fields = _draft_profile_fields(draft, STUDENT_DRAFT_PROFILE_FIELD_MAP)
         race_ids = _student_draft_race_ethnicity_ids(application, draft, using)
         if race_ids:
             fields["race_ethnicities"] = race_ids
@@ -597,7 +607,9 @@ def _prepare_incomplete_profile_updates(
             raise ApplicationFinalizationError(
                 f"The {slot} guardian application draft is inconsistent."
             )
-        prepared[(Adult, guardian.pk)] = _draft_profile_fields(draft, guardian_fields)
+        prepared[(Adult, guardian.pk)] = _draft_profile_fields(
+            draft, GUARDIAN_DRAFT_PROFILE_FIELD_MAP
+        )
     return prepared
 
 

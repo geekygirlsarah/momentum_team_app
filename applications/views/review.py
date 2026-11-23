@@ -57,6 +57,7 @@ from ..forms import (
     StaffDocumentUploadForm,
     StudentInfoForm,
 )
+from ..identity_sync import delete_orphaned_incomplete_profiles
 from ..models import (
     Application,
     ApplicationDocumentSubmission,
@@ -2784,6 +2785,11 @@ class ApplicationDeleteView(_ReviewerRequiredMixin, View):
                     "application_review_detail", app_id=application.application_id
                 )
             app_str = application.application_id
+            profile_ids = (
+                (Student, application.student_profile_id),
+                (Adult, application.primary_guardian_profile_id),
+                (Adult, application.secondary_guardian_profile_id),
+            )
             log_event(
                 event=AuditEvent.RECORD_DELETED,
                 resource=application,
@@ -2796,6 +2802,7 @@ class ApplicationDeleteView(_ReviewerRequiredMixin, View):
                 notes=f"Application {app_str} deleted by reviewer.",
             )
             application.delete()
+            delete_orphaned_incomplete_profiles(application, profile_ids, using=using)
         messages.success(request, f"Deleted application {app_str}.")
         return redirect("application_review_list")
 
@@ -2817,6 +2824,13 @@ class ApplicationCleanupView(_ReviewerRequiredMixin, View):
         )
         count = stale_apps.count()
         sample = stale_apps.first()
+        profile_ids = list(
+            stale_apps.values_list(
+                "student_profile_id",
+                "primary_guardian_profile_id",
+                "secondary_guardian_profile_id",
+            )
+        )
         if sample is not None:
             log_event(
                 event=AuditEvent.RECORD_DELETED,
@@ -2834,6 +2848,17 @@ class ApplicationCleanupView(_ReviewerRequiredMixin, View):
                 ),
             )
         stale_apps.delete()
+        if profile_ids and sample is not None:
+            orphan_candidates = tuple(
+                pair
+                for student_pk, primary_pk, secondary_pk in profile_ids
+                for pair in (
+                    (Student, student_pk),
+                    (Adult, primary_pk),
+                    (Adult, secondary_pk),
+                )
+            )
+            delete_orphaned_incomplete_profiles(sample, orphan_candidates)
 
         if count > 0:
             messages.success(

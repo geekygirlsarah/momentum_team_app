@@ -271,12 +271,13 @@ conversion uses the same validated transfer path.
 The read-only `evaluate_application_profile_edit` helper encodes the approved
 exact-linked-account, unique verified-email, and existing linked-guardian rules;
 edits to another guardian, ambiguous identities, or an unrelated student
-require lead review. It is not connected to applicant profile writes. The public
-wizard still creates legacy version-0 applications, and conversion for those
-applications continues through its existing email-matching path. Profile-workflow
-finalization can copy typed draft values to incomplete profiles, but the public
-wizard does not yet create or update those profiles. This remains a foundation,
-not an applicant-facing rollout. The JSON editor is unavailable for
+require lead review. It now authorizes the immediate profile edits described
+under "Verified wizard connected to isolated profiles and proposals" below.
+The public wizard still creates legacy version-0 applications by default, and
+conversion for those applications continues through its existing
+email-matching path; a version-1 application can be created directly (as the
+new end-to-end tests do) and finalized without any JSON or email-matching
+conversion step. The JSON editor is unavailable for
 profile-workflow applications. Lead reviewers can use the typed draft editor
 while a version-1 application awaits review; it reuses student and guardian
 form validation, scopes school and race choices to the application organization,
@@ -302,16 +303,141 @@ Step 6 is connected to typed question and fixed-answer records for version-1
 profile-workflow applications: the question set is frozen before display,
 answers are written under the locked application row with a signed state
 version, and confirmation reads and revalidates the typed answers. Version-0
-applications continue to use their existing JSON path. Other wizard steps,
-reminder and maintenance readers, and legacy conversion are not yet migrated;
-profile-workflow creation is not enabled for applicants. Before typed records
-can replace JSON, each remaining reader and writer must be migrated with
-application-row locking, stale conflict versions, staff/applicant audit
-coverage, and the approved per-person authorization and relationship-review
-rules. Legacy approved applications, protected documents, snapshot wording,
-fixed-answer conflicts, and historical audit snapshots must remain recoverable;
-any backfill or JSON removal needs a separately approved migration and recovery
-plan.
+applications continue to use their existing JSON path.
+
+### Verified wizard connected to isolated profiles and proposals (Delivery Step 4)
+
+`applications/identity_sync.py` connects Steps 5, 7, and 8 to typed drafts,
+isolated profiles, and identity/relationship proposals for
+`profile_workflow_version=1` applications, under the same `transaction.atomic`
+plus `select_for_update` lock on the application row that every other step
+writer already uses. Version-0 applications are unaffected; these steps keep
+writing `Application.data` exactly as before. On each version-1 step submit:
+
+- The typed `ApplicationStudentDraft`/`ApplicationGuardianDraft` row (and, for
+  Step 5, its race/ethnicity links) is created or updated from the validated
+  form data, replacing the equivalent JSON write.
+- `resolve_application_person_identity` is re-evaluated and the slot's
+  `ApplicationIdentityProposal` is replaced: a genuinely new person gets a
+  fresh, minimal incomplete profile (immediately linked via
+  `Application.student_profile`/`primary_guardian_profile`/
+  `secondary_guardian_profile`); a uniquely matched existing profile is
+  recorded as a candidate without being linked; an ambiguous match records no
+  candidate. Replacing the proposal on every submit keeps its baseline and any
+  prior decision in sync with the just-saved step, mirroring how editing a
+  typed draft from the review screen already resets dependent decisions.
+- `evaluate_application_profile_edit` decides whether the just-resolved unique
+  match may be edited immediately: an exact same-organization linked account,
+  a uniquely OTP-verified own email, or an existing authorized same-organization
+  guardian-student relationship. Only those cases write the submitted fields
+  onto the *existing* profile right away (locked, audited via
+  `AuditEvent.CONTACT_INFO_UPDATED`, using the same draft-to-profile field maps
+  `finalize_profile_workflow_application` uses for incomplete profiles). Every
+  other case — ambiguous identity, an unrelated guardian, another guardian's
+  email — leaves the profile unlinked for lead review and changes nothing.
+  `sync_student_identity` also accepts an `existing_student` override so a
+  parent's existing-student picker (not just an email match) can drive the same
+  authorization path.
+- For a present guardian draft, `sync_guardian_relationship_proposal` replaces
+  the guardian's `ApplicationRelationshipProposal` (action `ADD`, decision
+  `PENDING`). It never creates or edits a live `AdultStudentRelationship`:
+  additions only take effect at final approval, after lead review.
+- `touch_identity_proposal_baselines` re-stamps every proposal's
+  `baseline_application_updated_at` after the step's own routine progress save
+  (`current_step`/`applicant_progress_at`), so a later, unrelated step's save
+  does not make an earlier step's already-correct proposal look stale. The more
+  meaningful staleness checks — the linked profile's identity and its
+  `profile_revision` — are untouched by this and still catch an actual
+  conflicting edit.
+
+New-profile creation and an authorized direct edit's email change both take the
+tenant-scoped `programs.utils.email_coordination.claim_profile_emails` lock
+(see below) before re-checking for a conflicting profile and writing, so a
+concurrent wizard submission or an existing staff/import writer cannot create
+or claim the same organization/email at the same time; losing that race leaves
+the slot unresolved for lead review instead of creating a duplicate.
+
+Prefill for these three steps now reads the typed draft when one exists
+(falling back to the verified email for a brand-new Step 5 student applicant),
+so revisiting a saved version-1 step shows the same values without touching
+JSON. Step 9 confirmation's "at least one guardian opted in to email updates"
+check, and the post-submission `SubmittedView` summary page, both branch on
+`profile_workflow_version` and read the typed guardian/student drafts for
+version-1 applications instead of the JSON step keys, which are never
+populated for this workflow.
+
+#### Profile-email write coordination (`programs.utils.email_coordination`)
+
+`programs.models.ProfileEmailClaim` is a tenant-scoped `(organization,
+normalized_email)` row used purely as a lock target. Its organization
+foreign key uses `PROTECT`, consistent with every other organization-owned
+model. `claim_profile_emails(organization, emails, using=None)` must be called
+inside an existing `transaction.atomic()` block; it get-or-creates a claim row
+per normalized (trimmed, case-folded) email and returns them locked via
+`select_for_update()`, ordered by email to avoid deadlocking against another
+caller claiming the same emails in a different order. It takes no lock for a
+blank email. This is a coordination primitive only: it does not add a
+portal-wide email-uniqueness constraint, and a caller must still perform its
+own conflict check (and write) while holding the lock. `identity_sync.py`'s
+new-profile creation and authorized-edit paths are its first callers; no
+existing writer (`StudentForm`/`AdultForm`, the CSV import views, the alumni
+conversion helper, or the merge utilities) has been changed to take this lock,
+since doing so is a broader refactor across those call sites and was out of
+scope for this pass — see "Remaining Delivery Step 4 work" below.
+
+#### Maintenance and notification consumers migrated for version-1 applications
+
+- `applications/reminders.py`'s missing-documents candidate filter previously
+  matched a guardian recipient only through the JSON `step7_handoff`,
+  `step7-primaryparent`, or legacy `step7` paths, so a version-1 student
+  application with a linked primary guardian profile could never be selected
+  as a reminder candidate. It now also matches when
+  `profile_workflow_version=1` and the linked primary guardian profile (looked
+  up the same way `applications.services.document_recipient` does) has a
+  non-blank email.
+- Deleting an application — through the applicant's own withdraw action, a
+  reviewer's single delete, the reviewer's bulk 30-day cleanup, or the 30-day
+  expiration command — never deletes its linked incomplete `Student`/`Adult`
+  profiles (`Application.student_profile` and the two guardian links use
+  `on_delete=SET_NULL`, so the profile row survives on its own). Left
+  unaddressed, an abandoned incomplete profile would permanently occupy its
+  email and push every future application from that same person into lead
+  review forever, with no application left to review against. All four
+  deletion paths now call `applications.identity_sync.delete_orphaned_incomplete_profiles`
+  after the application row is gone, which deletes a captured profile only if
+  it is still incomplete, in the same organization, and no longer referenced
+  by any other application.
+
+#### Remaining Delivery Step 4 work and rollout status
+
+The public wizard (`WelcomeView.post`) still creates `profile_workflow_version=0`
+applications by default; this pass does not flip that default. The complete
+applicant → guardian document verification/upload → lead approval flow for a
+version-1 application is covered end to end by
+`applications/tests/test_profile_workflow_end_to_end.py`, including new
+families, idempotent re-approval, an ambiguous guardian identity blocking
+approval until a lead resolves it, cross-organization reviewer denial, and
+staff document upload — but enabling the workflow for real public traffic is
+intentionally deferred because:
+
+- The email-coordination lock is not yet adopted by the other profile-email
+  writers (`programs/forms.py`'s `StudentForm`/`AdultForm`, the CSV import
+  views, `programs/utils/alumni.py`, `programs/utils/merges.py`). Those
+  writers can still race against a concurrent wizard submission or each other
+  for the same email; see "Profile-email write coordination" above.
+- Row-lock and claim-serialization behavior has only been exercised on
+  SQLite in this pass. PostgreSQL transaction/locking tests, required before
+  claiming concurrency readiness, were not run in this environment.
+- Broader reporting/maintenance consumers beyond reminders and expiration
+  (for example org-wide digests) were not separately re-audited for
+  version-1 awareness in this pass.
+
+Before typed records can fully replace JSON for every consumer, each remaining
+reader and writer must be migrated with the same application-row locking,
+stale conflict detection, and audit coverage used here. Legacy approved
+applications, protected documents, snapshot wording, fixed-answer conflicts,
+and historical audit snapshots remain recoverable throughout; any backfill or
+JSON removal needs a separately approved migration and recovery plan.
 
 Conversion matches existing students and adults only within the application's
 organization and explicitly assigns that organization to new profiles,

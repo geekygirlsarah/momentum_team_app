@@ -25,6 +25,7 @@ from .communication import (
     EmailHistoryBatch,
     TrustedOutgoingEmailRecipient,
 )
+from .email_claims import ProfileEmailClaim
 from .enrollments import Enrollment
 from .fields import (
     EncryptedCharField,
@@ -95,6 +96,7 @@ __all__ = [
     "OrganizationManager",
     "OrganizationQuerySet",
     "Payment",
+    "ProfileEmailClaim",
     "Program",
     "ProgramDocument",
     "ProgramFeature",
