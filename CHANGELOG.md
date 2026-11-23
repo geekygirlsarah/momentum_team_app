@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## 2026-11-22
 
+### Added
+- Lead Mentors can edit typed fixed and active frozen-question answers for profile-workflow applications awaiting review, with stale-edit protection and audit events that omit answer values.
+
 ### Fixed
 - Platform and portal organization settings updates now preserve unrelated shared and structured settings, including email branding, sender identities, and payment instructions.
 

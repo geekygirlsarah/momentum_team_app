@@ -533,8 +533,13 @@
                  href="{% url 'application_review_edit' application.application_id %}">
                 <i class="bi bi-pencil-square me-1"></i>Edit captured data
               </a>
+            {% elif application.status == 'submitted' %}
+              <a class="btn btn-sm btn-outline-secondary"
+                 href="{% url 'application_review_edit_typed_answers' application.application_id %}">
+                <i class="bi bi-pencil-square me-1"></i>Edit typed answers
+              </a>
             {% else %}
-              <div class="text-muted small">Editing structured application details is not available yet.</div>
+              <div class="text-muted small">Typed answers are read-only unless this application is awaiting review.</div>
             {% endif %}
             <a class="btn btn-sm btn-outline-danger"
                href="{% url 'application_review_delete' application.application_id %}">

@@ -30,6 +30,7 @@ from .review import (
     ApplicationReviewDocumentDownloadView,
     ApplicationReviewListView,
     ApplicationStaffDocumentUploadView,
+    ApplicationTypedAnswerEditView,
     DeclineForm,
     _ReviewerRequiredMixin,
 )
@@ -147,6 +148,7 @@ __all__ = [
     "ApplicationReviewListView",
     "ApplicationRelationshipProposalDecisionView",
     "ApplicationStaffDocumentUploadView",
+    "ApplicationTypedAnswerEditView",
     "DeclineForm",
     "REVIEW_PERM",
     "_ReviewerRequiredMixin",

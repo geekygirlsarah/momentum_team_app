@@ -37,6 +37,11 @@ urlpatterns = [
         name="application_review_document_download",
     ),
     path(
+        "review/<str:app_id>/edit-typed-answers/",
+        views.ApplicationTypedAnswerEditView.as_view(),
+        name="application_review_edit_typed_answers",
+    ),
+    path(
         "review/<str:app_id>/approve/",
         views.ApplicationApproveView.as_view(),
         name="application_review_approve",

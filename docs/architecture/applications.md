@@ -177,12 +177,15 @@ answers through the existing key normalizer without rewriting legacy data just
 because the page was viewed. New conversions preserve nonblank custom answers
 with the exact wording shown, alongside the legacy experience answers.
 
-Staff review renders custom snapshots and flags malformed data. Lead Mentors may
-edit answers on submitted or approved applications; the wording and metadata are
-retained, required answers remain required, and stale edits are rejected. Answer
-edits use the existing application edit audit event. Staff edits remain
-read-only for in-progress applications and after conversion to avoid diverging
-from applicant answers or the student profile.
+Staff review renders custom snapshots and flags malformed data. For legacy
+applications, the existing JSON editor remains available. The typed answer editor
+is available to Lead Mentors only while a profile-workflow application is
+submitted and awaiting review; it edits fixed and active-program answers while
+preserving frozen wording and archived answers. Required answers remain required,
+and stale edits or edits after acceptance are rejected. Answer edits use the
+existing application edit audit event without recording answer values. This
+editor changes application answers only; it does not edit student or guardian
+profiles, and converted applications remain read-only.
 
 ### Typed application draft foundation (inactive)
 

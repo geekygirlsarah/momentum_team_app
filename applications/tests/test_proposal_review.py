@@ -839,3 +839,350 @@ class ApplicationProposalReviewTests(TestCase):
             ).exists()
         )
         self.assertEqual(student.primary_contact, new_primary)
+
+
+class StructuredAnswerReviewTests(TestCase):
+    def setUp(self):
+        self.organization = Organization.objects.create(
+            name="Structured Answer Organization",
+            slug="structured-answer-review",
+            subdomain="structured-answer-review",
+        )
+        self.program = Program.objects.create(
+            organization=self.organization,
+            name="Structured Answer Program",
+            active=True,
+        )
+        reviewer = get_user_model().objects.create_user(
+            username="structured-answer-reviewer",
+            email="reviewer@example.test",
+            password=None,
+        )
+        permission, _ = Permission.objects.get_or_create(
+            content_type=ContentType.objects.get_for_model(Application),
+            codename="review_application",
+            defaults={"name": "Can review applications"},
+        )
+        group, _ = Group.objects.get_or_create(name="LeadMentor")
+        group.permissions.add(permission)
+        reviewer.groups.add(group)
+        UserOrganizationMembership.objects.create(
+            user=reviewer,
+            organization=self.organization,
+            role="LeadMentor",
+            is_active=True,
+        )
+        self.reviewer = reviewer
+        self.client = Client(HTTP_HOST=f"{self.organization.subdomain}.localhost")
+        self.client.force_login(reviewer)
+        self.application = Application.objects.create(
+            organization=self.organization,
+            program=self.program,
+            applicant_type=Application.Type.STUDENT,
+            email="student@example.test",
+            email_verified_at=timezone.now(),
+            status=Application.Status.SUBMITTED,
+            submitted_at=timezone.now(),
+            profile_workflow_version=1,
+        )
+
+    def editor_url(self, application=None):
+        application = application or self.application
+        return reverse(
+            "application_review_edit_typed_answers",
+            args=[application.application_id],
+        )
+
+    @staticmethod
+    def state_version(response):
+        return response.context["form"]["state_version"].value()
+
+    def test_review_detail_links_to_typed_answer_editor(self):
+        response = self.client.get(
+            reverse("application_review_detail", args=[self.application.application_id])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.editor_url())
+        self.assertContains(response, "Edit typed answers")
+        self.assertNotContains(
+            response, "Editing structured application details is not available yet."
+        )
+
+    def test_editor_shows_frozen_active_questions_not_archived_questions(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Current fixed answer",
+        )
+        active_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        active_answer = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=active_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="What did the applicant see?",
+            is_required=True,
+            answer="Frozen answer",
+        )
+        archived_program = Program.objects.create(
+            organization=self.organization,
+            name="Previously selected program",
+        )
+        archived_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=archived_program,
+        )
+        archived_answer = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=archived_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Archived question wording?",
+            is_required=False,
+            answer="Archived answer",
+        )
+
+        response = self.client.get(self.editor_url())
+
+        self.assertEqual(response.status_code, 200)
+        form = response.context["form"]
+        self.assertEqual(
+            form.fields[f"fixed_answer_{fixed.pk}"].initial,
+            "Current fixed answer",
+        )
+        self.assertEqual(
+            form.fields[f"custom_answer_{active_answer.pk}"].label,
+            "What did the applicant see?",
+        )
+        self.assertNotIn(f"custom_answer_{archived_answer.pk}", form.fields)
+        self.assertContains(response, "What did the applicant see?")
+        self.assertNotContains(response, "Archived question wording?")
+
+    def test_editor_saves_answers_and_audits_without_answer_values(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Old fixed answer",
+        )
+        question_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        custom = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=question_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Required question?",
+            is_required=True,
+            answer="Old custom answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Updated fixed answer",
+                f"custom_answer_{custom.pk}": "Updated custom answer",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        fixed.refresh_from_db()
+        custom.refresh_from_db()
+        self.assertEqual(fixed.answer, "Updated fixed answer")
+        self.assertEqual(custom.answer, "Updated custom answer")
+        audit = AuditLog.objects.filter(
+            organization=self.organization,
+            event=AuditEvent.CONTACT_INFO_UPDATED,
+            resource_type="Application",
+            resource_id=str(self.application.pk),
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertNotIn("Updated fixed answer", repr(audit.before))
+        self.assertNotIn("Updated custom answer", repr(audit.after))
+
+    def test_missing_and_forged_state_versions_do_not_save(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+
+        for state_version in (None, "forged-version"):
+            data = {f"fixed_answer_{fixed.pk}": "Unsaved attempt"}
+            if state_version is not None:
+                data["state_version"] = state_version
+            response = self.client.post(self.editor_url(), data)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.context["form"].non_field_errors())
+            fixed.refresh_from_db()
+            self.assertEqual(fixed.answer, "Original answer")
+
+        self.assertTrue(token)
+
+    def test_stale_answer_version_preserves_current_data_and_submitted_value(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            answer="Competing answer"
+        )
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Stale submitted answer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context["form"][f"fixed_answer_{fixed.pk}"].value(),
+            "Stale submitted answer",
+        )
+        self.assertTrue(response.context["form"].non_field_errors())
+        fixed.refresh_from_db()
+        self.assertEqual(fixed.answer, "Competing answer")
+
+    def test_required_answers_cannot_be_cleared(self):
+        question_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        custom = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=question_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Required question?",
+            is_required=True,
+            answer="Required response",
+        )
+        response = self.client.get(self.editor_url())
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": self.state_version(response),
+                f"custom_answer_{custom.pk}": "   ",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["form"].errors)
+        custom.refresh_from_db()
+        self.assertEqual(custom.answer, "Required response")
+
+    def test_status_change_blocks_edits_after_editor_was_loaded(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+        Application.objects.filter(pk=self.application.pk).update(
+            status=Application.Status.APPROVED
+        )
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Post-approval edit",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        fixed.refresh_from_db()
+        self.assertEqual(fixed.answer, "Original answer")
+
+    def test_malformed_cross_organization_answer_ownership_fails_closed(self):
+        foreign_organization = Organization.objects.create(
+            name="Foreign Organization",
+            slug="foreign-answer-owner",
+            subdomain="foreign-answer-owner",
+        )
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Private answer",
+        )
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            organization=foreign_organization
+        )
+
+        response = self.client.get(self.editor_url())
+
+        self.assertRedirects(
+            response,
+            reverse("apply_start"),
+            fetch_redirect_response=False,
+        )
+
+    def test_reviewer_permission_and_application_tenant_are_required(self):
+        ordinary_user = get_user_model().objects.create_user(
+            username="ordinary-user",
+            email="ordinary@example.test",
+            password=None,
+        )
+        UserOrganizationMembership.objects.create(
+            user=ordinary_user,
+            organization=self.organization,
+            role="Student",
+            is_active=True,
+        )
+        self.client.force_login(ordinary_user)
+        response = self.client.get(self.editor_url())
+        self.assertEqual(response.status_code, 403)
+
+        foreign_organization = Organization.objects.create(
+            name="Foreign Organization",
+            slug="foreign-answer-review",
+            subdomain="foreign-answer-review",
+        )
+        response = self.client.get(
+            self.editor_url(),
+            HTTP_HOST=f"{foreign_organization.subdomain}.localhost",
+        )
+        self.assertIn(response.status_code, (403, 404))

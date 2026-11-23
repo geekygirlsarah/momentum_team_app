@@ -50,6 +50,7 @@ from ..models import (
     ApplicationFixedAnswer,
     ApplicationGuardianDraft,
     ApplicationIdentityProposal,
+    ApplicationQuestionAnswer,
     ApplicationQuestionSet,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
@@ -548,6 +549,51 @@ class ApplicationDataEditForm(forms.Form):
             if existing or touched:
                 data[data_key] = step
         return data
+
+
+class ApplicationTypedAnswerEditForm(forms.Form):
+    state_version = forms.CharField(widget=forms.HiddenInput)
+
+    def __init__(
+        self,
+        *args,
+        application,
+        fixed_answers,
+        custom_answers,
+        state_version,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.fields["state_version"].initial = state_version
+        self.answer_fields = []
+
+        for answer in fixed_answers:
+            labels = EXPERIENCE_QUESTIONS.get(answer.question_key)
+            label = (
+                labels[application.applicant_type == "parent"]
+                if labels
+                else answer.question_key.replace("_", " ").capitalize()
+            )
+            if answer.source_step != "step6-experience":
+                label = f"{label} ({answer.source_step})"
+            name = f"fixed_answer_{answer.pk}"
+            self.fields[name] = forms.CharField(
+                label=label,
+                required=False,
+                initial=answer.answer,
+                widget=forms.Textarea(attrs={"class": "form-control", "rows": 3}),
+            )
+            self.answer_fields.append((answer, name))
+
+        for answer in custom_answers:
+            name = f"custom_answer_{answer.pk}"
+            self.fields[name] = forms.CharField(
+                label=answer.question_text,
+                required=answer.is_required,
+                initial=answer.answer,
+                widget=forms.Textarea(attrs={"class": "form-control", "rows": 3}),
+            )
+            self.answer_fields.append((answer, name))
 
 
 class ApplicationEmailForm(forms.Form):
@@ -1727,6 +1773,224 @@ class ApplicationEditView(_ReviewerRequiredMixin, View):
             request,
             f"Updated application {application.application_id}.",
         )
+        return redirect("application_review_detail", app_id=application.application_id)
+
+
+def _typed_answer_state(application, *, lock=False):
+    using = application._state.db or "default"
+    fixed_answers_query = (
+        ApplicationFixedAnswer._base_manager.using(using)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+    )
+    question_sets_query = (
+        ApplicationQuestionSet._base_manager.using(using)
+        .filter(application_id=application.pk)
+        .order_by("pk")
+    )
+    if lock:
+        fixed_answers_query = fixed_answers_query.select_for_update()
+        question_sets_query = question_sets_query.select_for_update()
+    fixed_answers = list(fixed_answers_query)
+    question_sets = list(question_sets_query)
+    if any(
+        item.organization_id != application.organization_id for item in fixed_answers
+    ):
+        raise Http404
+    if any(
+        item.organization_id != application.organization_id for item in question_sets
+    ):
+        raise Http404
+    if any(
+        item.program.organization_id != application.organization_id
+        for item in question_sets
+    ):
+        raise Http404
+
+    answers_query = (
+        ApplicationQuestionAnswer._base_manager.using(using)
+        .filter(question_set_id__in=[item.pk for item in question_sets])
+        .order_by("question_set_id", "position", "pk")
+    )
+    if lock:
+        answers_query = answers_query.select_for_update()
+    question_answers = list(answers_query)
+    if any(
+        item.organization_id != application.organization_id for item in question_answers
+    ):
+        raise Http404
+
+    active_sets = {
+        item.pk: item
+        for item in question_sets
+        if item.program_id == application.program_id
+    }
+    active_answers = [
+        answer for answer in question_answers if answer.question_set_id in active_sets
+    ]
+    return fixed_answers, question_sets, question_answers, active_answers
+
+
+def _typed_answer_state_version(application, fixed_answers, question_sets, answers):
+    state = {
+        "application": {
+            "id": application.pk,
+            "organization_id": application.organization_id,
+            "workflow_version": application.profile_workflow_version,
+            "status": application.status,
+            "applicant_type": application.applicant_type,
+            "program_id": application.program_id,
+        },
+        "fixed_answers": [
+            [
+                item.pk,
+                item.organization_id,
+                item.source_step,
+                item.question_key,
+                item.answer,
+            ]
+            for item in fixed_answers
+        ],
+        "question_sets": [
+            [item.pk, item.organization_id, item.program_id, item.frozen_at.isoformat()]
+            for item in question_sets
+        ],
+        "question_answers": [
+            [
+                item.pk,
+                item.organization_id,
+                item.question_set_id,
+                str(item.question_id),
+                item.position,
+                item.question_text,
+                item.is_required,
+                item.answer,
+            ]
+            for item in answers
+        ],
+    }
+    serialized = json.dumps(state, sort_keys=True, separators=(",", ":"))
+    return salted_hmac(
+        "applications.typed_answer_state", serialized, algorithm="sha1"
+    ).hexdigest()
+
+
+class ApplicationTypedAnswerEditView(_ReviewerRequiredMixin, View):
+    template_name = "applications/review/edit_typed_answers.html"
+
+    def _get_application(self, request, app_id):
+        application = _get_tenant_application(request, app_id)
+        if application.profile_workflow_version != 1:
+            raise Http404
+        if application.status != Application.Status.SUBMITTED:
+            messages.error(
+                request,
+                "Typed application answers can only be edited while the application is awaiting review.",
+            )
+            return None
+        return application
+
+    def _render(self, request, application, form):
+        return render(
+            request,
+            self.template_name,
+            {"application": application, "form": form},
+        )
+
+    def get(self, request, app_id: str):
+        application = self._get_application(request, app_id)
+        if application is None:
+            return _proposal_review_redirect(_get_tenant_application(request, app_id))
+        fixed_answers, question_sets, answers, active_answers = _typed_answer_state(
+            application
+        )
+        version = _typed_answer_state_version(
+            application, fixed_answers, question_sets, answers
+        )
+        form = ApplicationTypedAnswerEditForm(
+            application=application,
+            fixed_answers=fixed_answers,
+            custom_answers=active_answers,
+            state_version=version,
+        )
+        return self._render(request, application, form)
+
+    @transaction.atomic
+    def post(self, request, app_id: str):
+        application = _get_tenant_application(request, app_id)
+        application = (
+            Application.objects.for_organization(application.organization)
+            .select_for_update()
+            .get(pk=application.pk, superseded_at__isnull=True)
+        )
+        if application.profile_workflow_version != 1:
+            raise Http404
+        if application.status != Application.Status.SUBMITTED:
+            messages.error(
+                request,
+                "Typed application answers can only be edited while the application is awaiting review.",
+            )
+            return _proposal_review_redirect(application)
+
+        fixed_answers, question_sets, answers, active_answers = _typed_answer_state(
+            application, lock=True
+        )
+        version = _typed_answer_state_version(
+            application, fixed_answers, question_sets, answers
+        )
+        form = ApplicationTypedAnswerEditForm(
+            request.POST,
+            application=application,
+            fixed_answers=fixed_answers,
+            custom_answers=active_answers,
+            state_version=version,
+        )
+        if not constant_time_compare(request.POST.get("state_version", ""), version):
+            form.is_valid()
+            form.add_error(
+                None,
+                "The application or its answers changed after you opened this page. "
+                "Your entries remain here but were not saved; reload before trying again.",
+            )
+            return self._render(request, application, form)
+        if not form.is_valid():
+            return self._render(request, application, form)
+
+        changed_fixed = []
+        changed_custom = []
+        for answer, field_name in form.answer_fields:
+            new_answer = form.cleaned_data[field_name] or ""
+            if (answer.answer or "") == new_answer:
+                continue
+            old_value = answer.answer or ""
+            answer.answer = new_answer
+            answer.save(using=application._state.db, update_fields=["answer"])
+            if isinstance(answer, ApplicationFixedAnswer):
+                changed_fixed.append((answer.pk, old_value, new_answer))
+            else:
+                changed_custom.append((answer.pk, old_value, new_answer))
+
+        if changed_fixed or changed_custom:
+            log_event(
+                request=request,
+                event=AuditEvent.CONTACT_INFO_UPDATED,
+                resource=application,
+                before={
+                    "fixed_answer_ids": [item[0] for item in changed_fixed],
+                    "custom_answer_ids": [item[0] for item in changed_custom],
+                },
+                after={
+                    "fixed_answer_ids": [item[0] for item in changed_fixed],
+                    "custom_answer_ids": [item[0] for item in changed_custom],
+                },
+                notes=(
+                    f"Typed application answers edited by {request.user}; "
+                    f"{len(changed_fixed)} fixed and {len(changed_custom)} custom answers changed."
+                ),
+            )
+            messages.success(request, "Updated the typed application answers.")
+        else:
+            messages.info(request, "No typed application answers were changed.")
         return redirect("application_review_detail", app_id=application.application_id)
 
 
