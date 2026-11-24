@@ -253,6 +253,22 @@ choose an operational cadence that keeps each run within a bounded `--limit`.
 Schedule only the non-dry-run command after those checks; no scheduler or
 deployment configuration is changed by the feature.
 
+A deployment's own scheduler (for example, operating-system `cron`) is
+responsible for actually invoking these two commands on a recurring basis; the
+application does not provide one. A reasonable cadence, once dry-run output has
+been reviewed per organization, is running `send_application_reminders` hourly
+(it is claim-based and safe to run more often than the 48-hour inactivity and
+3-day deadline windows it checks) and `expire_applications --execute` once
+daily, both invoked once per organization slug, for example:
+
+```cron
+0 * * * * /path/to/venv/bin/python manage.py send_application_reminders --organization <slug>
+15 2 * * * /path/to/venv/bin/python manage.py expire_applications --organization <slug> --execute
+```
+
+Adjust paths, timing, and the organization list for the deployment; this is
+illustrative only and is not itself a scheduler configuration change.
+
 Each trigger is claimed before transport and recorded in the tenant-scoped
 reminder ledger. A confirmed pre-send `failed` outcome may be retried on a later
 run. A transport `unknown` outcome or a `pending` claim left by an interrupted

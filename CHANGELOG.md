@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## 2026-11-24
 
+### Changed
+- New applications now use the redesigned application process by default: student and guardian details are saved directly to an isolated draft profile as each step is completed, acceptance requires required forms and lead review of any new or ambiguous family matches, and a single reviewer approval finalizes the application without a separate "Convert" step.
+
 ### Fixed
+- A student or adult record is no longer incorrectly treated as a duplicate email because of a same-email record in a completely different organization; email-match checks now only consider records within the same organization.
 - Deadline reminders for an unfinished application are now due starting three days before the program's application window closes, matching the originally requested timing, instead of two.
 - A profile-workflow application's direct edit to a student or guardian profile is no longer applied if the authorization it relied on (such as an existing guardian relationship) is revoked by another change in the moment between the authorization check and the write; the edit is now left for lead review instead.
 

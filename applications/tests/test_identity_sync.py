@@ -20,6 +20,7 @@ from applications.models import (
     ApplicationIdentityProposal,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
 )
 from applications.tests.access_helpers import verify_application_browser
 from organizations.models import Organization
@@ -150,6 +151,97 @@ class NewPersonCreationTests(IdentitySyncTestCase):
         # resolved; the stale one is simply no longer linked.
         application.refresh_from_db()
         self.assertEqual(application.student_profile_id, second.profile.pk)
+
+
+class NewPersonProfileFieldsLiveTests(IdentitySyncTestCase):
+    """A genuinely new person's isolated incomplete profile is populated
+    with everything the applicant has entered so far (not just identity
+    fields), so the data flows to the profile live as the applicant
+    progresses rather than waiting for final lead approval."""
+
+    def test_new_student_profile_is_populated_with_draft_fields(self):
+        from programs.models import RaceEthnicity, School
+
+        race = RaceEthnicity.objects.create(
+            organization=self.organization, name="Prefer not to say"
+        )
+        application, request = self._verified_application(
+            Application.Type.STUDENT, "new.student.fields@example.test"
+        )
+        draft = self._student_draft(
+            application,
+            personal_email="",
+            address="123 Main St",
+            city="Pittsburgh",
+            state="PA",
+            zip_code="15213",
+            phone_number="412-555-0100",
+            phone_type="cell",
+            school_name="Steel High School",
+            graduation_year=2029,
+        )
+        ApplicationStudentDraftRaceEthnicity.objects.create(
+            organization=self.organization,
+            student_draft=draft,
+            race_ethnicity=race,
+        )
+
+        result = sync_student_identity(application, draft, request=request)
+
+        profile = result.profile
+        self.assertEqual(profile.address, "123 Main St")
+        self.assertEqual(profile.city, "Pittsburgh")
+        self.assertEqual(profile.state, "PA")
+        self.assertEqual(profile.zip_code, "15213")
+        self.assertEqual(profile.phone_number, "412-555-0100")
+        self.assertEqual(profile.graduation_year, 2029)
+        self.assertIsNotNone(profile.school)
+        self.assertEqual(profile.school.name, "Steel High School")
+        self.assertTrue(
+            School.objects.filter(
+                organization=self.organization, name="Steel High School"
+            ).exists()
+        )
+        self.assertEqual(
+            list(profile.race_ethnicities.values_list("pk", flat=True)), [race.pk]
+        )
+
+    def test_new_student_profile_school_not_listed_leaves_school_blank(self):
+        application, request = self._verified_application(
+            Application.Type.STUDENT, "new.student.noschool@example.test"
+        )
+        draft = self._student_draft(
+            application, personal_email="", school_not_listed=True
+        )
+
+        result = sync_student_identity(application, draft, request=request)
+
+        self.assertIsNone(result.profile.school)
+
+    def test_new_guardian_profile_is_populated_with_draft_fields(self):
+        application, request = self._verified_application(
+            Application.Type.PARENT, "new.parent.fields@example.test"
+        )
+        draft = self._guardian_draft(
+            application,
+            ApplicationGuardianDraft.Slot.PRIMARY,
+            email="new.parent.fields@example.test",
+            address="456 Oak Rd",
+            city="Pittsburgh",
+            state="PA",
+            zip_code="15213",
+            phone_number="412-555-0200",
+            phone_type="cell",
+        )
+
+        result = sync_guardian_identity(application, draft, request=request)
+
+        profile = result.profile
+        self.assertEqual(profile.address, "456 Oak Rd")
+        self.assertEqual(profile.city, "Pittsburgh")
+        self.assertEqual(profile.state, "PA")
+        self.assertEqual(profile.zip_code, "15213")
+        self.assertEqual(profile.phone_number, "412-555-0200")
 
 
 class AuthorizedDirectEditTests(IdentitySyncTestCase):

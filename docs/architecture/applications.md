@@ -461,35 +461,52 @@ the wizard's identity check needs to be race-free against.
   disaster-recovery tool, not a routine report, so it was left as a known
   limitation rather than expanded.
 
-#### Remaining Delivery Step 4 work and rollout status
+#### Delivery Step 4 status: live by default
 
-The public wizard (`WelcomeView.post`) still creates `profile_workflow_version=0`
-applications by default; this pass does not flip that default. The complete
-applicant → guardian document verification/upload → lead approval flow for a
-version-1 application is covered end to end by
-`applications/tests/test_profile_workflow_end_to_end.py`, including new
-families, idempotent re-approval, an ambiguous guardian identity blocking
-approval until a lead resolves it, cross-organization reviewer denial, and
-staff document upload — but enabling the workflow for real public traffic is
-intentionally deferred because:
+The public wizard (`WelcomeView.post`) now creates `profile_workflow_version=1`
+applications by default. New applicants' isolated incomplete `Student`/`Adult`
+profiles are populated with every answer as the applicant progresses through
+the wizard — not just minimal identity fields held back until approval —
+using the same `STUDENT_DRAFT_PROFILE_FIELD_MAP`/`GUARDIAN_DRAFT_PROFILE_FIELD_MAP`
+field maps (including school lookup/creation and race/ethnicity selections)
+that finalization re-applies at acceptance, so finalization's re-copy is a
+no-op for fields already current. The complete applicant → guardian document
+verification/upload → lead approval flow for a version-1 application is
+covered end to end by `applications/tests/test_profile_workflow_end_to_end.py`,
+including new families, idempotent re-approval, an ambiguous guardian identity
+blocking approval until a lead resolves it, cross-organization reviewer
+denial, and staff document upload. `applications/tests/test_integration_flows.py`
+exercises the same default through the full public wizard URLs for student,
+parent, and multi-step back-and-forward flows.
 
-- A previously identified stale-authorization race in `applications/identity_sync.py`
-  is now fixed: `_apply_direct_edit` re-evaluates `evaluate_application_profile_edit`
-  against the just-locked profile before writing, instead of trusting the
-  caller's earlier unlocked check, so a concurrent change to the authorizing
-  fact (e.g. a guardian relationship removed between the check and the lock)
-  blocks the edit rather than applying it under stale authorization
-  (`test_identity_sync.py::StaleAuthorizationRecheckTests`).
-- `programs/utils/email_coordination.py`'s claim lock now has a genuine
-  multi-threaded regression (`test_email_coordination.py::ClaimProfileEmailsConcurrencyTests`)
-  that runs two concurrent writers on separate threads/connections against the
-  same (organization, email) pair. This environment cannot reach PostgreSQL
-  (port 5432 is not reachable here), so locally it only exercises the
-  sequential SQLite fallback; CI's `ci.yml` runs the suite against a real
-  `postgres:16` service, so this is the first test that can give genuine
-  row-lock evidence there. It must be observed passing in CI before treating
-  concurrency as verified — this repository checkout has not seen that result
-  for this exact change.
+A previously identified stale-authorization race in `applications/identity_sync.py`
+is fixed: `_apply_direct_edit` re-evaluates `evaluate_application_profile_edit`
+against the just-locked profile before writing, instead of trusting the
+caller's earlier unlocked check, so a concurrent change to the authorizing
+fact (e.g. a guardian relationship removed between the check and the lock)
+blocks the edit rather than applying it under stale authorization
+(`test_identity_sync.py::StaleAuthorizationRecheckTests`).
+
+`Student.clean()`/`Adult.clean()`'s email-uniqueness checks are now scoped to
+the profile's own organization. Previously these checks queried across every
+organization in the portal, so creating a student or adult in one organization
+could be blocked by — or reveal the existence of — a same-email record in a
+completely unrelated organization, a cross-tenant information leak in a
+multi-organization portal. A shared email across two different organizations
+is no longer treated as a conflict (`programs/tests/test_models/test_students.py::StudentEmailUniquenessOrganizationScopingTests`,
+`test_adults.py::AdultEmailUniquenessOrganizationScopingTests`).
+
+`programs/utils/email_coordination.py`'s claim lock has a genuine
+multi-threaded regression (`test_email_coordination.py::ClaimProfileEmailsConcurrencyTests`)
+that runs two concurrent writers on separate threads/connections against the
+same (organization, email) pair. This environment cannot reach PostgreSQL
+(port 5432 is not reachable here), so locally it only exercises the sequential
+SQLite fallback; CI's `ci.yml` runs the suite against a real `postgres:16`
+service, so this is the first test that can give genuine row-lock evidence
+there. The project owner tests locally (including against real PostgreSQL)
+before any deploy, per their own stated workflow, and has directed that the
+live default be flipped now on that basis; this is noted here rather than
+claimed as independently verified in this environment.
 
 Before typed records can fully replace JSON for every consumer, each remaining
 reader and writer must be migrated with the same application-row locking,
@@ -514,7 +531,9 @@ later conversion error may remain in storage.
 `send_application_reminders --organization <slug>` processes a bounded batch for
 one active organization. Its `--dry-run` reports only an eligible-message count;
 it does not create claims, update application timestamps, or send email. No
-automatic scheduler is configured by this feature.
+automatic scheduler is configured by this feature; operators invoke it on
+their own recurring schedule (for example, operating-system `cron`). See
+`docs/operations.md` for a documented, illustrative cadence.
 
 New applications start with `applicant_progress_at`. Successful applicant wizard
 writes, handoff, submission, and applicant document uploads advance that clock;
@@ -551,7 +570,8 @@ guardian document verification.
 batch for one active organization. It is read-only by default; only the explicit
 `--execute` option permanently deletes eligible applications and their owned
 uploaded files. The default batch size is 200 and the maximum is 500. No
-automatic scheduler is configured.
+automatic scheduler is configured; see `docs/operations.md` for a documented,
+illustrative cadence.
 
 The 30-day clock starts at the last recorded applicant progress. Existing
 applications without `applicant_progress_at` use `updated_at` as an

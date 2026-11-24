@@ -61,7 +61,9 @@ class WelcomeView(View):
     def post(self, request):
         # POST on Step 1 means "start a new application".
         organization = _require_organization(request)
-        application = Application.objects.create(organization=organization)
+        application = Application.objects.create(
+            organization=organization, profile_workflow_version=1
+        )
         _start_bootstrap(request, application)
         return redirect("apply_step2", app_id=application.application_id)
 

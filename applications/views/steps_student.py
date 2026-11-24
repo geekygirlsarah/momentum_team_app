@@ -180,6 +180,48 @@ def _guardian_draft_initial(application, slot):
     }
 
 
+_STUDENT_DRAFT_DISPLAY_FIELDS = (
+    "legal_first_name",
+    "preferred_first_name",
+    "last_name",
+    "pronouns",
+    "date_of_birth",
+    "address",
+    "city",
+    "state",
+    "zip_code",
+    "personal_email",
+    "phone_number",
+    "phone_type",
+    "can_receive_texts",
+    "directory_consent",
+    "grade",
+    "tshirt_size",
+    "allergies",
+    "dietary_restrictions",
+    "medical_notes",
+)
+
+
+def _student_draft_display_fields(draft):
+    """Return a JSON-legacy-shaped dict of a typed student draft's answered
+    fields, for prefill (Step 5) and read-only display (Step 9)."""
+    fields = {
+        field: value
+        for field in _STUDENT_DRAFT_DISPLAY_FIELDS
+        if (value := getattr(draft, field)) not in (None, "")
+    }
+    if draft.school_not_listed:
+        fields["school_name"] = NOT_LISTED_SCHOOL
+    elif draft.school_name:
+        fields["school_name"] = draft.school_name
+    if draft.pk:
+        fields["race_ethnicities"] = list(
+            draft.race_ethnicities.values_list("pk", flat=True)
+        )
+    return fields
+
+
 def _guardian_draft_email(application, slot):
     draft = _present_guardian_draft(application, slot)
     return (draft.email or "") if draft is not None else ""
@@ -1314,40 +1356,7 @@ class Step5StudentInfoView(View):
                 application=application
             ).first()
             if draft is not None:
-                initial = {
-                    field: value
-                    for field in (
-                        "legal_first_name",
-                        "preferred_first_name",
-                        "last_name",
-                        "pronouns",
-                        "date_of_birth",
-                        "address",
-                        "city",
-                        "state",
-                        "zip_code",
-                        "personal_email",
-                        "phone_number",
-                        "phone_type",
-                        "can_receive_texts",
-                        "directory_consent",
-                        "grade",
-                        "tshirt_size",
-                        "allergies",
-                        "dietary_restrictions",
-                        "medical_notes",
-                    )
-                    if (value := getattr(draft, field)) not in (None, "")
-                }
-                if draft.school_not_listed:
-                    initial["school_name"] = NOT_LISTED_SCHOOL
-                elif draft.school_name:
-                    initial["school_name"] = draft.school_name
-                if draft.pk:
-                    initial["race_ethnicities"] = list(
-                        draft.race_ethnicities.values_list("pk", flat=True)
-                    )
-                return initial
+                return _student_draft_display_fields(draft)
             if application.applicant_type == Application.Type.STUDENT:
                 return {"personal_email": application.email}
             return {}
@@ -2784,24 +2793,50 @@ class Step9ConfirmView(View):
             except ValueError as exc:
                 custom_snapshot = []
                 custom_snapshot_error = str(exc)
+
+        if application.profile_workflow_version == 1:
+            # Steps 5, 7 and 8 save typed drafts rather than JSON `data` for
+            # this version, so the review page reads the same typed records
+            # instead of (empty) legacy keys.
+            student_draft = ApplicationStudentDraft.objects.filter(
+                application=application
+            ).first()
+            step5_data = (
+                _student_draft_display_fields(student_draft)
+                if student_draft is not None
+                else {}
+            )
+            step5_school_not_listed = bool(
+                student_draft is not None and student_draft.school_not_listed
+            )
+            step7_data = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+            step8_data = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.SECONDARY
+            )
+            step8_skipped = not step8_data
+        else:
+            step5_data = data.get("step5-student") or {}
+            step5_school_not_listed = bool(step5_data.get("_school_not_listed"))
+            step7_data = data.get("step7-primaryparent") or {}
+            step8_data = data.get("step8-secondaryparent") or {}
+            step8_skipped = bool(step8_data.get("_skipped"))
+
         return render(
             request,
             self.template_name,
             {
                 "application": application,
                 "form": form,
-                "step5_data": data.get("step5-student") or {},
+                "step5_data": step5_data,
                 "step6_data": step6_data,
                 "step6_custom_data": custom_snapshot,
                 "custom_snapshot_error": custom_snapshot_error,
-                "step7_data": data.get("step7-primaryparent") or {},
-                "step8_data": data.get("step8-secondaryparent") or {},
-                "step8_skipped": bool(
-                    (data.get("step8-secondaryparent") or {}).get("_skipped")
-                ),
-                "step5_school_not_listed": bool(
-                    (data.get("step5-student") or {}).get("_school_not_listed")
-                ),
+                "step7_data": step7_data,
+                "step8_data": step8_data,
+                "step8_skipped": step8_skipped,
+                "step5_school_not_listed": step5_school_not_listed,
                 "current_step": 9,
                 "total_steps": TOTAL_STEPS,
             },

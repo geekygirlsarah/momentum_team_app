@@ -33,7 +33,7 @@ from django.db.models import Q
 
 from audit.events import AuditEvent
 from audit.service import log_event
-from programs.models import Adult, Student
+from programs.models import Adult, School, Student
 from programs.utils.email_coordination import (
     claim_profile_emails,
     normalize_claim_email,
@@ -49,7 +49,13 @@ from .models import (
     ApplicationIdentityProposal,
     ApplicationRelationshipProposal,
 )
-from .proposals import GUARDIAN_DRAFT_PROFILE_FIELD_MAP, STUDENT_DRAFT_PROFILE_FIELD_MAP
+from .proposals import (
+    GUARDIAN_DRAFT_PROFILE_FIELD_MAP,
+    STUDENT_DRAFT_PROFILE_FIELD_MAP,
+    ApplicationFinalizationError,
+    draft_profile_fields,
+    student_draft_race_ethnicity_ids,
+)
 from .services import ApplicationIdentityResolution, resolve_application_person_identity
 
 #: Authorization outcomes that permit an immediate, pre-review profile edit.
@@ -130,14 +136,36 @@ def _set_slot_profile(application, *, slot, profile, using) -> None:
     application.save(using=using, update_fields=[field_name, "updated_at"])
 
 
-def _create_incomplete_student(application, draft, *, using):
-    """Create a minimal incomplete ``Student`` profile for a genuinely new person.
+def _student_school_updates(application, draft, *, using):
+    """Return the ``Student`` field updates for a draft's school choice.
 
-    Only identity fields are copied here; ``finalize_profile_workflow_application``
-    (``applications.proposals``) copies every other draft field, including
-    school and race/ethnicity, onto the profile at acceptance time using
-    ``STUDENT_DRAFT_PROFILE_FIELD_MAP``. Keeping the field copy in one place
-    avoids the two call sites drifting apart.
+    Mirrors the school handling in ``applications.proposals``'s finalization
+    path: an explicit "not listed" clears any school, a named school is
+    looked up or created immediately (this always runs inside the caller's
+    lock on the ``Application`` row), and an unanswered school leaves the
+    field untouched.
+    """
+    if draft.school_not_listed is True:
+        return {"school": None}
+    if draft.school_name is not None and draft.school_name.strip():
+        school, _ = School._base_manager.using(using).get_or_create(
+            organization_id=application.organization_id,
+            name=draft.school_name.strip(),
+        )
+        return {"school": school}
+    return {}
+
+
+def _create_incomplete_student(application, draft, *, using):
+    """Create an incomplete ``Student`` profile for a genuinely new person,
+    populated with everything the applicant has entered so far.
+
+    This copies the same ``STUDENT_DRAFT_PROFILE_FIELD_MAP`` fields (plus
+    school and race/ethnicity) that ``finalize_profile_workflow_application``
+    (``applications.proposals``) later re-applies at acceptance time, so the
+    isolated profile reflects the applicant's answers as they progress
+    through the wizard rather than only once a lead approves. Re-applying the
+    same, already-current values at finalization is a no-op.
     """
     organization = application.organization
     email = draft.personal_email or ""
@@ -150,23 +178,30 @@ def _create_incomplete_student(application, draft, *, using):
         raise ApplicationIdentitySyncConflict(
             "A matching student or guardian now exists for this email."
         )
+    fields = draft_profile_fields(draft, STUDENT_DRAFT_PROFILE_FIELD_MAP)
+    fields["personal_email"] = email or None
+    fields.update(_student_school_updates(application, draft, using=using))
     student = Student(
         organization=organization,
         is_incomplete_application_profile=True,
-        legal_first_name=draft.legal_first_name or "",
-        last_name=draft.last_name or "",
-        personal_email=email or None,
-        date_of_birth=draft.date_of_birth,
+        **fields,
     )
     student.save(using=using)
+    try:
+        race_ids = student_draft_race_ethnicity_ids(application, draft, using)
+    except ApplicationFinalizationError as exc:
+        raise ApplicationIdentitySyncConflict(str(exc)) from exc
+    if race_ids:
+        student.race_ethnicities.set(race_ids)
     return student
 
 
 def _create_incomplete_guardian(application, draft, *, using):
-    """Create a minimal incomplete ``Adult`` profile for a genuinely new guardian.
+    """Create an incomplete ``Adult`` profile for a genuinely new guardian,
+    populated with everything the applicant has entered so far.
 
-    See :func:`_create_incomplete_student` for why only identity fields are
-    copied here.
+    See :func:`_create_incomplete_student` for why the full draft field map
+    is copied immediately rather than only at finalization.
     """
     organization = application.organization
     email = draft.email or ""
@@ -179,13 +214,13 @@ def _create_incomplete_guardian(application, draft, *, using):
         raise ApplicationIdentitySyncConflict(
             "A matching student or guardian now exists for this email."
         )
+    fields = draft_profile_fields(draft, GUARDIAN_DRAFT_PROFILE_FIELD_MAP)
+    fields["personal_email"] = email or None
     adult = Adult(
         organization=organization,
         is_incomplete_application_profile=True,
         is_parent=True,
-        legal_first_name=draft.legal_first_name or "",
-        last_name=draft.last_name or "",
-        personal_email=email or None,
+        **fields,
     )
     adult.save(using=using)
     return adult

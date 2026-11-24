@@ -471,7 +471,7 @@ def validate_application_profile_email_claims(
     return ""
 
 
-def _draft_profile_fields(draft, field_map):
+def draft_profile_fields(draft, field_map):
     return {
         profile_field: value
         for draft_field, profile_field in field_map.items()
@@ -525,7 +525,7 @@ GUARDIAN_DRAFT_PROFILE_FIELD_MAP = {
 }
 
 
-def _student_draft_race_ethnicity_ids(application, draft, using):
+def student_draft_race_ethnicity_ids(application, draft, using):
     links = list(
         ApplicationStudentDraftRaceEthnicity._base_manager.using(using)
         .filter(student_draft_id=draft.pk)
@@ -575,8 +575,8 @@ def _prepare_incomplete_profile_updates(
             raise ApplicationFinalizationError(
                 "The student application draft belongs to another organization."
             )
-        fields = _draft_profile_fields(draft, STUDENT_DRAFT_PROFILE_FIELD_MAP)
-        race_ids = _student_draft_race_ethnicity_ids(application, draft, using)
+        fields = draft_profile_fields(draft, STUDENT_DRAFT_PROFILE_FIELD_MAP)
+        race_ids = student_draft_race_ethnicity_ids(application, draft, using)
         if race_ids:
             fields["race_ethnicities"] = race_ids
         if draft.school_not_listed is True:
@@ -607,7 +607,7 @@ def _prepare_incomplete_profile_updates(
             raise ApplicationFinalizationError(
                 f"The {slot} guardian application draft is inconsistent."
             )
-        prepared[(Adult, guardian.pk)] = _draft_profile_fields(
+        prepared[(Adult, guardian.pk)] = draft_profile_fields(
             draft, GUARDIAN_DRAFT_PROFILE_FIELD_MAP
         )
     return prepared

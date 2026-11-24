@@ -1,5 +1,7 @@
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+from organizations.models import Organization
 from programs.models import Adult, RaceEthnicity, School, Student
 
 
@@ -87,6 +89,82 @@ class DemographicModelTests(TestCase):
         )
         qs2 = RaceEthnicity.match_from_text("Something totally unknown")
         self.assertIn("other", set(qs2.values_list("key", flat=True)))
+
+
+class StudentEmailUniquenessOrganizationScopingTests(TestCase):
+    """``Student.clean()``'s email-uniqueness check is scoped to the
+    student's own organization: a shared email across two different,
+    unrelated organizations is not a conflict, and must not be rejected or
+    otherwise reveal the existence of a same-email record in another
+    tenant."""
+
+    def setUp(self):
+        self.org_a = Organization.objects.create(name="Org A", slug="org-a-email-scope")
+        self.org_b = Organization.objects.create(name="Org B", slug="org-b-email-scope")
+
+    def test_same_organization_duplicate_student_email_is_rejected(self):
+        Student.objects.create(
+            organization=self.org_a,
+            legal_first_name="Riley",
+            last_name="First",
+            personal_email="shared@example.test",
+        )
+        duplicate = Student(
+            organization=self.org_a,
+            legal_first_name="Jordan",
+            last_name="Second",
+            personal_email="shared@example.test",
+        )
+        with self.assertRaises(ValidationError):
+            duplicate.full_clean()
+
+    def test_same_organization_student_email_matching_adult_is_rejected(self):
+        Adult.objects.create(
+            organization=self.org_a,
+            legal_first_name="Pat",
+            last_name="Guardian",
+            personal_email="shared@example.test",
+        )
+        student = Student(
+            organization=self.org_a,
+            legal_first_name="Jordan",
+            last_name="Second",
+            personal_email="shared@example.test",
+        )
+        with self.assertRaises(ValidationError):
+            student.full_clean()
+
+    def test_different_organization_duplicate_student_email_is_allowed(self):
+        Student.objects.create(
+            organization=self.org_a,
+            legal_first_name="Riley",
+            last_name="First",
+            personal_email="shared@example.test",
+        )
+        other_org_student = Student(
+            organization=self.org_b,
+            legal_first_name="Jordan",
+            last_name="Second",
+            personal_email="shared@example.test",
+        )
+        # Must NOT raise: a different organization's record with the same
+        # email is not a conflict in a multi-organization portal.
+        other_org_student.full_clean()
+
+    def test_different_organization_student_email_matching_adult_is_allowed(self):
+        Adult.objects.create(
+            organization=self.org_a,
+            legal_first_name="Pat",
+            last_name="Guardian",
+            personal_email="shared@example.test",
+        )
+        other_org_student = Student(
+            organization=self.org_b,
+            legal_first_name="Jordan",
+            last_name="Second",
+            personal_email="shared@example.test",
+        )
+        other_org_student.full_clean()
 
 
 class UnsavedStudentModelTests(TestCase):
