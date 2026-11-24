@@ -9,6 +9,11 @@ from django.utils import timezone
 
 from attendance.models import AttendanceSession
 from organizations.models import Organization
+from organizations.utils import (
+    get_organization_localdate,
+    get_organization_timezone,
+    get_organization_timezone_name,
+)
 from outreach.models import (
     OutreachEvent,
     OutreachMentorSignup,
@@ -47,8 +52,11 @@ def get_upcoming_calendar_events(
     if not isinstance(organization, Organization) or organization.pk is None:
         return []
 
-    ref_date = reference_date or timezone.localdate()
+    organization_timezone = get_organization_timezone(organization)
+    ref_date = reference_date or get_organization_localdate(organization)
     end_date = ref_date + datetime.timedelta(days=days_ahead)
+    query_start_date = ref_date - datetime.timedelta(days=1)
+    query_end_date = end_date + datetime.timedelta(days=1)
     events = []
 
     try:
@@ -77,8 +85,37 @@ def get_upcoming_calendar_events(
                     can_read = True
 
             if can_read:
-                feed_events = feed.get_events_for_date_range(ref_date, end_date)
-                events.extend(feed_events)
+                feed_events = feed.get_events_for_date_range(
+                    query_start_date, query_end_date
+                )
+                for event in feed_events:
+                    if event.get("all_day"):
+                        if ref_date <= event["date"] <= end_date:
+                            events.append(event)
+                        continue
+
+                    start_datetime = event.get("start_datetime")
+                    if not start_datetime:
+                        continue
+                    local_start = timezone.localtime(
+                        start_datetime, organization_timezone
+                    )
+                    local_date = local_start.date()
+                    if not ref_date <= local_date <= end_date:
+                        continue
+
+                    local_event = dict(event)
+                    local_event["date"] = local_date
+                    local_event["start_datetime"] = local_start
+                    local_event["start_time"] = local_start.time().replace(tzinfo=None)
+                    end_datetime = event.get("end_datetime")
+                    if end_datetime:
+                        local_end = timezone.localtime(
+                            end_datetime, organization_timezone
+                        )
+                        local_event["end_datetime"] = local_end
+                        local_event["end_time"] = local_end.time().replace(tzinfo=None)
+                    events.append(local_event)
 
         events.sort(key=lambda e: (e["date"], e["start_time"] or datetime.time.min))
     except Exception:
@@ -277,7 +314,9 @@ def collect_student_digest_data(
     reference_date: Optional[datetime.date] = None,
 ) -> Dict[str, Any]:
     """Collect upcoming commitments, open outreach opportunities, attendance, calendar events, and action items for a student."""
-    ref_date = reference_date or timezone.localdate()
+    organization = student.organization
+    calendar_time_zone = get_organization_timezone_name(organization)
+    ref_date = reference_date or get_organization_localdate(organization)
     end_date = ref_date + datetime.timedelta(days=days_ahead)
 
     organization_id = student.organization_id
@@ -436,7 +475,7 @@ def collect_student_digest_data(
 
     # 6. Upcoming calendar events from active feeds
     calendar_events = get_upcoming_calendar_events(
-        organization=student.organization,
+        organization=organization,
         user=student.user,
         role="Student",
         days_ahead=days_ahead,
@@ -536,6 +575,7 @@ def collect_student_digest_data(
         "student": student,
         "days_ahead": days_ahead,
         "reference_date": ref_date,
+        "calendar_time_zone": calendar_time_zone,
         "end_date": end_date,
         "confirmed_shifts": confirmed_shifts,
         "open_opportunities": open_opportunities,
@@ -554,7 +594,9 @@ def collect_parent_digest_data(
     reference_date: Optional[datetime.date] = None,
 ) -> Dict[str, Any]:
     """Collect commitments, updates, and calendar events for all active enrolled students of a parent."""
-    ref_date = reference_date or timezone.localdate()
+    organization = adult.organization
+    calendar_time_zone = get_organization_timezone_name(organization)
+    ref_date = reference_date or get_organization_localdate(organization)
     end_date = ref_date + datetime.timedelta(days=days_ahead)
     organization_id = adult.organization_id
 
@@ -581,7 +623,7 @@ def collect_parent_digest_data(
                 student__organization_id=organization_id,
                 student_id__in=active_student_ids,
             )
-            .select_related("student")
+            .select_related("student__organization__organization_settings")
             .order_by("student__last_name", "student__preferred_first_name")
         )
         linked_students = list(
@@ -600,7 +642,7 @@ def collect_parent_digest_data(
             students_data.append(s_data)
 
     calendar_events = get_upcoming_calendar_events(
-        organization=adult.organization,
+        organization=organization,
         user=adult.user,
         role="Parent",
         days_ahead=days_ahead,
@@ -657,6 +699,7 @@ def collect_parent_digest_data(
         "adult": adult,
         "days_ahead": days_ahead,
         "reference_date": ref_date,
+        "calendar_time_zone": calendar_time_zone,
         "end_date": end_date,
         "students_data": students_data,
         "calendar_events": calendar_events,
@@ -671,7 +714,9 @@ def collect_mentor_digest_data(
     reference_date: Optional[datetime.date] = None,
 ) -> Dict[str, Any]:
     """Collect mentor commitments, shifts needing support, attendance stats, calendar events, and action items."""
-    ref_date = reference_date or timezone.localdate()
+    organization = adult.organization
+    calendar_time_zone = get_organization_timezone_name(organization)
+    ref_date = reference_date or get_organization_localdate(organization)
     end_date = ref_date + datetime.timedelta(days=days_ahead)
 
     # 1. Confirmed mentor signups
@@ -846,7 +891,7 @@ def collect_mentor_digest_data(
 
     # 5. Upcoming calendar events from active feeds
     calendar_events = get_upcoming_calendar_events(
-        organization=adult.organization,
+        organization=organization,
         user=adult.user,
         role="Mentor",
         days_ahead=days_ahead,
@@ -897,6 +942,7 @@ def collect_mentor_digest_data(
         "adult": adult,
         "days_ahead": days_ahead,
         "reference_date": ref_date,
+        "calendar_time_zone": calendar_time_zone,
         "end_date": end_date,
         "confirmed_shifts": confirmed_shifts,
         "needs_support_shifts": needs_support_shifts,
@@ -914,9 +960,11 @@ def get_weekly_digest_recipients(
     reference_date: Optional[datetime.date] = None,
 ) -> List[Dict[str, Any]]:
     """Determine all recipient targets and build their digest data."""
-    ref_date = reference_date or timezone.localdate()
+    ref_date = reference_date
     targets = []
-    active_student_qs = _active_digest_students().select_related("user")
+    active_student_qs = _active_digest_students().select_related(
+        "user", "organization__organization_settings"
+    )
 
     # 1. Students
     if role in ("all", "student"):
@@ -951,7 +999,9 @@ def get_weekly_digest_recipients(
                 adult__organization_id=F("organization_id"),
             )
             .filter(organization_id=F("student__organization_id"))
-            .select_related("adult", "adult__user")
+            .select_related(
+                "adult", "adult__user", "adult__organization__organization_settings"
+            )
             .order_by("adult_id")
         )
         for relationship in parent_relationships:
@@ -982,10 +1032,14 @@ def get_weekly_digest_recipients(
 
     # 3. Mentors
     if role in ("all", "mentor"):
-        mentors = active_mentors().filter(
-            login_enabled=True,
-            organization_id__isnull=False,
-            organization__is_active=True,
+        mentors = (
+            active_mentors()
+            .filter(
+                login_enabled=True,
+                organization_id__isnull=False,
+                organization__is_active=True,
+            )
+            .select_related("user", "organization__organization_settings")
         )
         for m in mentors:
             email = (

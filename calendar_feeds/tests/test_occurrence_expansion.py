@@ -1,4 +1,5 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase
 from django.utils import timezone
@@ -7,6 +8,7 @@ from calendar_feeds.models import EventException
 from calendar_feeds.tests.factories import make_event, make_feed
 from calendar_feeds.utils import expand_events_for_range
 from organizations.models import Organization
+from organizations.utils import update_organization_settings
 
 
 class OccurrenceExpansionTests(TestCase):
@@ -134,4 +136,96 @@ class OccurrenceExpansionTests(TestCase):
         self.assertEqual(instance["start_datetime"], self.start + timedelta(days=1))
         self.assertEqual(
             instance["end_datetime"], self.start + timedelta(days=3, hours=3)
+        )
+
+
+class DSTRecurrenceTests(TestCase):
+    def setUp(self):
+        self.feed = make_feed()
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/New_York"}
+        )
+
+    def event(self, start, *, rrule="FREQ=WEEKLY;COUNT=3", **kwargs):
+        return make_event(
+            self.feed,
+            start_datetime=start,
+            end_datetime=start + timedelta(hours=1),
+            rrule_ical=rrule,
+            **kwargs,
+        )
+
+    def test_spring_dst_recurrence_keeps_organization_wall_time(self):
+        event = self.event(timezone.make_aware(datetime(2026, 3, 1, 14), timezone.UTC))
+
+        instances = expand_events_for_range(
+            self.feed, date(2026, 3, 1), date(2026, 3, 15)
+        )
+
+        starts = [instance["start_datetime"] for instance in instances]
+        self.assertEqual(
+            starts,
+            [
+                datetime(2026, 3, 1, 9, tzinfo=ZoneInfo("America/New_York")),
+                datetime(2026, 3, 8, 9, tzinfo=ZoneInfo("America/New_York")),
+                datetime(2026, 3, 15, 9, tzinfo=ZoneInfo("America/New_York")),
+            ],
+        )
+        self.assertTrue(all(instance["event"] == event for instance in instances))
+
+    def test_explicit_utc_until_includes_occurrence_at_cutoff(self):
+        self.event(
+            timezone.make_aware(datetime(2026, 3, 1, 14), timezone.UTC),
+            rrule="FREQ=WEEKLY;UNTIL=20260308T130000Z",
+        )
+
+        instances = expand_events_for_range(
+            self.feed, date(2026, 3, 1), date(2026, 3, 15)
+        )
+
+        self.assertEqual(
+            [instance["date"] for instance in instances],
+            [date(2026, 3, 1), date(2026, 3, 8)],
+        )
+
+    def test_fall_dst_recurrence_keeps_organization_wall_time(self):
+        self.event(timezone.make_aware(datetime(2026, 10, 25, 13), timezone.UTC))
+
+        instances = expand_events_for_range(
+            self.feed, date(2026, 10, 25), date(2026, 11, 8)
+        )
+
+        starts = [instance["start_datetime"] for instance in instances]
+        self.assertEqual(
+            starts,
+            [
+                datetime(2026, 10, 25, 9, tzinfo=ZoneInfo("America/New_York")),
+                datetime(2026, 11, 1, 9, tzinfo=ZoneInfo("America/New_York")),
+                datetime(2026, 11, 8, 9, tzinfo=ZoneInfo("America/New_York")),
+            ],
+        )
+
+    def test_spring_dst_exceptions_keep_utc_date_identity(self):
+        start = datetime(2026, 3, 1, 23, 30, tzinfo=ZoneInfo("America/New_York"))
+        event = self.event(start)
+        exception = EventException.objects.create(
+            event=event,
+            original_date=date(2026, 3, 9),
+            change_type=EventException.CHANGE_CHANGED,
+            new_title="Changed after DST",
+        )
+
+        (instance,) = expand_events_for_range(
+            self.feed, date(2026, 3, 8), date(2026, 3, 8)
+        )
+
+        self.assertEqual(instance["date"], date(2026, 3, 8))
+        self.assertEqual(instance["original_date"], date(2026, 3, 9))
+        self.assertEqual(instance["exception_pk"], exception.pk)
+        self.assertEqual(instance["title"], "Changed after DST")
+
+        event.exdate_ical = "2026-03-09"
+        event.save()
+        self.assertEqual(
+            expand_events_for_range(self.feed, date(2026, 3, 8), date(2026, 3, 8)), []
         )

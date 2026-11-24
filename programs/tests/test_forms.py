@@ -6,6 +6,7 @@ from django.test import TestCase
 from organizations.models import Organization
 from programs.forms import AdultForm, StudentForm
 from programs.models import Adult
+from programs.models.email_claims import ProfileEmailClaim
 
 
 class StudentFormTests(TestCase):
@@ -49,6 +50,26 @@ class StudentFormTests(TestCase):
         self.assertTrue(form.is_valid(), form.errors)
         student = form.save()
         self.assertEqual(student.graduation_year, end_year)
+
+    def test_save_claims_personal_email_for_coordination(self):
+        """Saving must take the cross-writer email lock so a concurrent
+        writer (e.g. the application wizard) can't race this save."""
+        form = StudentForm(
+            data={
+                "legal_first_name": "Riley",
+                "last_name": "Fox",
+                "personal_email": "riley.fox@example.com",
+                "date_of_birth": "2010-01-01",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        student = form.save()
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=student.organization,
+                normalized_email="riley.fox@example.com",
+            ).exists()
+        )
 
     def test_parents_sync_includes_primary_and_secondary(self):
         form = StudentForm(

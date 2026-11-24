@@ -11,9 +11,11 @@ from django.views.decorators.cache import never_cache
 
 from audit.events import AuditEvent
 from audit.service import log_event
+from programs.models import Adult, Student
 
 from ..forms import ResumeApplicationForm
-from ..models import Application
+from ..identity_sync import delete_orphaned_incomplete_profiles
+from ..models import Application, ApplicationGuardianDraft, ApplicationStudentDraft
 from ..services import (
     PENDING_STATUSES,
     applications_for_user,
@@ -22,6 +24,7 @@ from ..services import (
     required_application_documents_complete,
 )
 from .browser import _require_browser_access, _start_bootstrap
+from .steps_student import _present_guardian_draft
 from .utils import (
     TOTAL_STEPS,
     _auto_authorize_handoff,
@@ -58,7 +61,9 @@ class WelcomeView(View):
     def post(self, request):
         # POST on Step 1 means "start a new application".
         organization = _require_organization(request)
-        application = Application.objects.create(organization=organization)
+        application = Application.objects.create(
+            organization=organization, profile_workflow_version=1
+        )
         _start_bootstrap(request, application)
         return redirect("apply_step2", app_id=application.application_id)
 
@@ -179,6 +184,11 @@ class ApplicationWithdrawView(LoginRequiredMixin, View):
         if application is None:
             return redirect("profile_dashboard")
         app_str = application.application_id
+        profile_ids = (
+            (Student, application.student_profile_id),
+            (Adult, application.primary_guardian_profile_id),
+            (Adult, application.secondary_guardian_profile_id),
+        )
         log_event(
             event=AuditEvent.RECORD_DELETED,
             resource=application,
@@ -191,6 +201,7 @@ class ApplicationWithdrawView(LoginRequiredMixin, View):
             notes=f"Application {app_str} withdrawn (deleted) by its owner.",
         )
         application.delete()
+        delete_orphaned_incomplete_profiles(application, profile_ids)
         messages.success(request, f"Your application {app_str} was withdrawn.")
         return redirect("profile_dashboard")
 
@@ -216,6 +227,51 @@ class SubmittedView(View):
         else:
             current_step = min(max(application.current_step, 10), TOTAL_STEPS)
             total_steps = TOTAL_STEPS
+        if application.profile_workflow_version == 1:
+            student_draft = ApplicationStudentDraft.objects.filter(
+                application=application
+            ).first()
+            primary_draft = _present_guardian_draft(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+            secondary_draft = _present_guardian_draft(
+                application, ApplicationGuardianDraft.Slot.SECONDARY
+            )
+            step5_data = (
+                {
+                    "legal_first_name": student_draft.legal_first_name,
+                    "preferred_first_name": student_draft.preferred_first_name,
+                    "last_name": student_draft.last_name,
+                }
+                if student_draft is not None
+                else {}
+            )
+            step7_data = (
+                {
+                    "legal_first_name": primary_draft.legal_first_name,
+                    "preferred_first_name": primary_draft.preferred_first_name,
+                    "last_name": primary_draft.last_name,
+                }
+                if primary_draft is not None
+                else {}
+            )
+            step8_data = (
+                {
+                    "legal_first_name": secondary_draft.legal_first_name,
+                    "preferred_first_name": secondary_draft.preferred_first_name,
+                    "last_name": secondary_draft.last_name,
+                }
+                if secondary_draft is not None
+                else {}
+            )
+            step8_skipped = secondary_draft is None
+            step6_data = {}
+        else:
+            step5_data = application.data.get("step5-student") or {}
+            step6_data = application.data.get("step6-experience") or {}
+            step7_data = application.data.get("step7-primaryparent") or {}
+            step8_data = application.data.get("step8-secondaryparent") or {}
+            step8_skipped = bool(step8_data.get("_skipped"))
         return render(
             request,
             self.template_name,
@@ -228,15 +284,11 @@ class SubmittedView(View):
                 ),
                 "current_step": current_step,
                 "total_steps": total_steps,
-                "step5_data": application.data.get("step5-student") or {},
-                "step6_data": application.data.get("step6-experience") or {},
-                "step7_data": application.data.get("step7-primaryparent") or {},
-                "step8_data": application.data.get("step8-secondaryparent") or {},
-                "step8_skipped": bool(
-                    (application.data.get("step8-secondaryparent") or {}).get(
-                        "_skipped"
-                    )
-                ),
+                "step5_data": step5_data,
+                "step6_data": step6_data,
+                "step7_data": step7_data,
+                "step8_data": step8_data,
+                "step8_skipped": step8_skipped,
                 "mentor_info_data": application.data.get("mentor_info") or {},
             },
         )

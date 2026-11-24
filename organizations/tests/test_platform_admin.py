@@ -16,6 +16,7 @@ from organizations.models import (
     OrganizationSettings,
     UserOrganizationMembership,
 )
+from organizations.platform_forms import PlatformOrganizationForm
 from organizations.platform_views import (
     PlatformDashboardView,
     PlatformMetricsView,
@@ -382,6 +383,35 @@ class PlatformOrganizationManagementTests(TestCase):
                 actor=self.superuser,
             ).exists()
         )
+
+    def test_platform_organization_form_rejects_invalid_time_zone(self):
+        form = PlatformOrganizationForm(
+            data={
+                "name": "Invalid Time Zone Organization",
+                "slug": "invalid-time-zone",
+                "subdomain": "",
+                "is_active": True,
+                "theme_color": "#0056b3",
+                "time_zone": "Invalid/Zone",
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("time_zone", form.errors)
+
+    def test_platform_organization_form_preserves_structured_time_zone(self):
+        organization = Organization.objects.create(
+            name="Structured Time Zone Organization",
+            slug="structured-time-zone",
+            settings={},
+        )
+        OrganizationSettings.objects.create(
+            organization=organization, data={"time_zone": "Europe/London"}
+        )
+
+        form = PlatformOrganizationForm(instance=organization)
+
+        self.assertEqual(form.fields["time_zone"].initial, "Europe/London")
 
     def test_create_organization_with_initial_lead_mentor(self):
         """Creating an organization with existing user email assigns Lead Mentor role immediately."""

@@ -20,10 +20,15 @@ from calendar_feeds.models import (
     EventException,
 )
 from GoSAdminPortal.test_runner import _assign_default_test_org
-from organizations.models import Organization, UserOrganizationMembership
+from organizations.models import (
+    Organization,
+    OrganizationSettings,
+    UserOrganizationMembership,
+)
 from organizations.utils import (
     get_organization_email_settings,
     update_organization_email_settings,
+    update_organization_settings,
 )
 from outreach.models import (
     OutreachEvent,
@@ -478,6 +483,126 @@ class WeeklyDigestServiceTests(TestCase):
         self.assertEqual(
             mentor_data["calendar_events"][0]["title"], "Team All-Hands Meeting"
         )
+
+    def test_calendar_events_use_organization_timezone_at_date_boundaries_and_dst(self):
+        organization = self.student.organization
+        update_organization_settings(organization, {"time_zone": "America/New_York"})
+        feed = CalendarFeed.objects.create(
+            organization=organization,
+            name="Time Zone Calendar",
+            slug="time-zone-calendar",
+            visibility=CalendarFeed.VISIBILITY_ANONYMOUS,
+            source_type=CalendarFeed.SOURCE_MANUAL,
+            is_active=True,
+        )
+        CalendarEvent.objects.create(
+            organization=organization,
+            feed=feed,
+            title="Local Previous-Day Event",
+            start_datetime=datetime.datetime(
+                2026, 3, 8, 4, 30, tzinfo=datetime.timezone.utc
+            ),
+            end_datetime=datetime.datetime(
+                2026, 3, 8, 5, 30, tzinfo=datetime.timezone.utc
+            ),
+        )
+        CalendarEvent.objects.create(
+            organization=organization,
+            feed=feed,
+            title="After DST Starts",
+            start_datetime=datetime.datetime(
+                2026, 3, 8, 7, 30, tzinfo=datetime.timezone.utc
+            ),
+            end_datetime=datetime.datetime(
+                2026, 3, 8, 8, 30, tzinfo=datetime.timezone.utc
+            ),
+        )
+        CalendarEvent.objects.create(
+            organization=organization,
+            feed=feed,
+            title="All-Day Event",
+            all_day=True,
+            start_datetime=datetime.datetime(
+                2026, 3, 8, 0, 0, tzinfo=datetime.timezone.utc
+            ),
+            end_datetime=datetime.datetime(
+                2026, 3, 9, 0, 0, tzinfo=datetime.timezone.utc
+            ),
+        )
+        CalendarEvent.objects.create(
+            organization=organization,
+            feed=feed,
+            title="Recurring After DST",
+            start_datetime=datetime.datetime(
+                2026, 3, 1, 14, 0, tzinfo=datetime.timezone.utc
+            ),
+            end_datetime=datetime.datetime(
+                2026, 3, 1, 15, 0, tzinfo=datetime.timezone.utc
+            ),
+            rrule_ical="FREQ=WEEKLY;COUNT=3",
+        )
+
+        previous_day_events = get_upcoming_calendar_events(
+            organization,
+            reference_date=datetime.date(2026, 3, 7),
+            days_ahead=0,
+        )
+        local_previous_day = next(
+            event
+            for event in previous_day_events
+            if event["title"] == "Local Previous-Day Event"
+        )
+        self.assertEqual(local_previous_day["date"], datetime.date(2026, 3, 7))
+        self.assertEqual(local_previous_day["start_time"], datetime.time(23, 30))
+
+        dst_events = get_upcoming_calendar_events(
+            organization,
+            reference_date=datetime.date(2026, 3, 8),
+            days_ahead=0,
+        )
+        after_dst_starts = next(
+            event for event in dst_events if event["title"] == "After DST Starts"
+        )
+        self.assertEqual(after_dst_starts["date"], datetime.date(2026, 3, 8))
+        self.assertEqual(after_dst_starts["start_time"], datetime.time(3, 30))
+        self.assertEqual(
+            after_dst_starts["start_datetime"].utcoffset(),
+            datetime.timedelta(hours=-4),
+        )
+        recurring_after_dst = next(
+            event for event in dst_events if event["title"] == "Recurring After DST"
+        )
+        self.assertEqual(recurring_after_dst["date"], datetime.date(2026, 3, 8))
+        self.assertEqual(recurring_after_dst["start_time"], datetime.time(9, 0))
+        all_day_event = next(
+            event for event in dst_events if event["title"] == "All-Day Event"
+        )
+        self.assertEqual(all_day_event["date"], datetime.date(2026, 3, 8))
+        self.assertIsNone(all_day_event["start_time"])
+
+    def test_invalid_organization_timezone_falls_back_to_django_default(self):
+        from organizations.utils import get_organization_timezone
+
+        organization = self.student.organization
+        update_organization_settings(organization, {"time_zone": "Invalid/Zone"})
+
+        self.assertEqual(
+            get_organization_timezone(organization), timezone.get_default_timezone()
+        )
+
+    def test_structured_organization_timezone_is_used_when_shared_setting_is_missing(
+        self,
+    ):
+        from organizations.utils import get_organization_timezone
+
+        organization = self.student.organization
+        organization.settings = {}
+        OrganizationSettings.objects.update_or_create(
+            organization=organization,
+            defaults={"data": {"time_zone": "Europe/London"}},
+        )
+
+        self.assertEqual(get_organization_timezone(organization).key, "Europe/London")
 
     def test_student_and_mentor_action_items(self):
         # Add fee with balance due
@@ -1356,6 +1481,9 @@ class SendWeeklyDigestCommandTests(TestCase):
 
     def test_email_template_rendering_content(self):
         # Add attendance, calendar event, fee, document
+        update_organization_settings(
+            self.student.organization, {"time_zone": "America/New_York"}
+        )
         AttendanceSession.objects.create(
             program=self.program,
             student=self.student,
@@ -1393,6 +1521,7 @@ class SendWeeklyDigestCommandTests(TestCase):
         self.assertGreaterEqual(len(mail.outbox), 2)
         student_mail = next(m for m in mail.outbox if "student@example.com" in m.to)
         parent_mail = next(m for m in mail.outbox if "parent@example.com" in m.to)
+        mentor_mail = next(m for m in mail.outbox if "mentor@example.com" in m.to)
 
         # Student email checks
         self.assertIn("Attendance Snapshot", student_mail.body)
@@ -1405,3 +1534,5 @@ class SendWeeklyDigestCommandTests(TestCase):
         self.assertIn("Attendance Snapshot", parent_mail.body)
         self.assertIn("Design Review Workshop", parent_mail.body)
         self.assertIn("Program Balance Due", parent_mail.body)
+        for message in (student_mail, parent_mail, mentor_mail):
+            self.assertIn("Times shown in America/New_York", message.body)

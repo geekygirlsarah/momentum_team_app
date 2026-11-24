@@ -654,12 +654,16 @@ class Student(models.Model):
 
         from .adults import Adult
 
-        # Students shouldn't have duplicate emails with each other or with parents.
+        # Students shouldn't have duplicate emails with each other or with parents,
+        # within the same organization. Different organizations are entirely
+        # separate tenants, so a shared email across organizations is neither
+        # a conflict nor something this check should reveal.
         if self.personal_email:
             email = self.personal_email.strip().lower()
             # Check other students
             others = Student.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             )
             if self.pk:
                 others = others.exclude(pk=self.pk)
@@ -672,7 +676,8 @@ class Student(models.Model):
 
             # Check parents/mentors
             if Adult.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             ).exists():
                 raise ValidationError(
                     {
@@ -684,7 +689,8 @@ class Student(models.Model):
             email = self.org_email.strip().lower()
             # Check other students
             others = Student.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             )
             if self.pk:
                 others = others.exclude(pk=self.pk)
@@ -695,7 +701,8 @@ class Student(models.Model):
 
             # Check parents/mentors
             if Adult.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             ).exists():
                 raise ValidationError(
                     {"org_email": "This email is already in use by a parent or mentor."}

@@ -9,7 +9,14 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from applications.models import Application
+from applications.answers import structured_fixed_experience_answers
+from applications.models import (
+    Application,
+    ApplicationGuardianDraft,
+    ApplicationIdentityProposal,
+    ApplicationRelationshipProposal,
+    ApplicationStudentDraft,
+)
 from applications.tests.access_helpers import verify_application_browser
 from organizations.models import UserOrganizationMembership
 from programs.models import Enrollment, Program, RaceEthnicity, School, Student
@@ -88,10 +95,47 @@ class ApplicationIntegrationFlowTests(TestCase):
                 msg += f" Form errors: {response.context['form'].errors}"
             self.fail(msg)
 
+    def _resolve_and_confirm_all_proposals(self, app_id):
+        """Lead mentor walks every open identity/relationship proposal to an
+        explicit decision, required before a profile-workflow (version 1)
+        application can be approved."""
+        for proposal in ApplicationIdentityProposal.objects.filter(
+            application__application_id=app_id
+        ):
+            if proposal.match_state == ApplicationIdentityProposal.MatchState.UNIQUE:
+                if proposal.candidate_student_id:
+                    target = f"student:{proposal.candidate_student_id}"
+                else:
+                    target = f"adult:{proposal.candidate_adult_id}"
+                decision_payload = {"decision": "confirmed", "target_profile": target}
+            else:
+                decision_payload = {"decision": "no_match"}
+            response = self.client.post(
+                reverse(
+                    "application_review_identity_decision",
+                    kwargs={"app_id": app_id, "proposal_id": proposal.pk},
+                ),
+                decision_payload,
+            )
+            self.assertEqual(response.status_code, 302)
+        for proposal in ApplicationRelationshipProposal.objects.filter(
+            application__application_id=app_id
+        ):
+            response = self.client.post(
+                reverse(
+                    "application_review_relationship_decision",
+                    kwargs={"app_id": app_id, "proposal_id": proposal.pk},
+                ),
+                {"decision": "approved"},
+            )
+            self.assertEqual(response.status_code, 302)
+
     def test_student_application_to_conversion_flow(self):
         """
-        Story: A Student applies through the wizard, a Lead Mentor approves it,
-        and then converts it to a real Student record.
+        Story: A Student applies through the wizard, and a Lead Mentor
+        approves it, which finalizes the isolated profile into a real,
+        active Student record (profile-workflow applications finalize at
+        approval, with no separate "Convert" click).
         """
         # 1. Start application
         response = self.client.post(reverse("apply_start"), follow=True)
@@ -158,9 +202,12 @@ class ApplicationIntegrationFlowTests(TestCase):
         self.assertStepSuccess(response, app, 6)
 
         # 6. Step 6: Experience
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
             reverse("apply_step6", args=[app_id]),
             {
+                "experience_version": step6_token,
                 "interest_reason": "I love robots",
                 "hoped_gains": "Programming skills",
             },
@@ -238,7 +285,16 @@ class ApplicationIntegrationFlowTests(TestCase):
         # --- Lead Mentor Review ---
         self.client.force_login(self.reviewer)
 
-        # 12. Approve
+        # Profile-workflow (version 1) applications require every identity
+        # and relationship proposal to receive an explicit lead decision
+        # before approval can finalize them.
+        self._resolve_and_confirm_all_proposals(app_id)
+
+        # 12. Approve. Profile-workflow (version 1) applications are
+        # finalized atomically at approval time: the isolated incomplete
+        # Student/Adult records become the real, active profiles, so there
+        # is no separate "Convert" step (the explicit convert button is
+        # blocked for these applications).
         response = self.client.post(
             reverse("application_review_approve", args=[app_id]), follow=True
         )
@@ -247,29 +303,22 @@ class ApplicationIntegrationFlowTests(TestCase):
             response, reverse("application_review_detail", args=[app_id])
         )
         app.refresh_from_db()
+        # No program documents are configured in this test, so there is
+        # nothing to sign and approval lands directly on APPROVED.
         self.assertEqual(app.status, Application.Status.APPROVED)
-
-        # 13. Convert
-        response = self.client.post(
-            reverse("application_review_convert", args=[app_id]), follow=True
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertRedirects(
-            response, reverse("application_review_detail", args=[app_id])
-        )
-        app.refresh_from_db()
-        self.assertEqual(app.status, Application.Status.CONVERTED)
-        self.assertTrue(app.converted_student)
+        student = Student.objects.get(pk=app.student_profile_id)
+        self.assertEqual(student.legal_first_name, "Ada")
+        self.assertFalse(student.is_incomplete_application_profile)
         self.assertTrue(
-            Enrollment.objects.filter(
-                student=app.converted_student, program=self.program
-            ).exists()
+            Enrollment.objects.filter(student=student, program=self.program).exists()
         )
 
     def test_parent_application_to_conversion_flow(self):
         """
         Story: A Parent applies on behalf of their student through the wizard,
-        gets approved and converted.
+        and gets approved, which finalizes the isolated profile into a real,
+        active Student record (profile-workflow applications finalize at
+        approval, with no separate "Convert" click).
         """
         # 1. Start application
         response = self.client.post(reverse("apply_start"), follow=True)
@@ -324,9 +373,14 @@ class ApplicationIntegrationFlowTests(TestCase):
         self.assertStepSuccess(response, app, 6)
 
         # 6. Step 6: Experience
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
             reverse("apply_step6", args=[app_id]),
-            {"interest_reason": "Loves building things"},
+            {
+                "experience_version": step6_token,
+                "interest_reason": "Loves building things",
+            },
             follow=True,
         )
         self.assertStepSuccess(response, app, 7)
@@ -374,8 +428,11 @@ class ApplicationIntegrationFlowTests(TestCase):
         app.refresh_from_db()
         self.assertEqual(app.status, Application.Status.SUBMITTED)
 
-        # --- Review & Convert ---
+        # --- Review & Approve. Profile-workflow (version 1) applications
+        # are finalized atomically at approval time, so there is no separate
+        # "Convert" step. ---
         self.client.force_login(self.reviewer)
+        self._resolve_and_confirm_all_proposals(app_id)
         response = self.client.post(
             reverse("application_review_approve", args=[app_id]), follow=True
         )
@@ -383,17 +440,17 @@ class ApplicationIntegrationFlowTests(TestCase):
         self.assertRedirects(
             response, reverse("application_review_detail", args=[app_id])
         )
-        response = self.client.post(
-            reverse("application_review_convert", args=[app_id]), follow=True
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertRedirects(
-            response, reverse("application_review_detail", args=[app_id])
-        )
 
         app.refresh_from_db()
-        self.assertEqual(app.status, Application.Status.CONVERTED)
-        self.assertEqual(app.converted_student.legal_first_name, "Bob")
+        # No program documents are configured in this test, so there is
+        # nothing to sign and approval lands directly on APPROVED.
+        self.assertEqual(app.status, Application.Status.APPROVED)
+        student = Student.objects.get(pk=app.student_profile_id)
+        self.assertEqual(student.legal_first_name, "Bob")
+        self.assertFalse(student.is_incomplete_application_profile)
+        self.assertTrue(
+            Enrollment.objects.filter(student=student, program=self.program).exists()
+        )
 
     def test_parent_flow_survives_multistep_back_and_forward(self):
         """
@@ -448,9 +505,12 @@ class ApplicationIntegrationFlowTests(TestCase):
         )
         self.assertStepSuccess(response, app, 6)
 
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
             reverse("apply_step6", args=[app_id]),
             {
+                "experience_version": step6_token,
                 "interest_reason": "Loves building things",
                 "prior_robotics_experience": "Some motors",
             },
@@ -527,22 +587,33 @@ class ApplicationIntegrationFlowTests(TestCase):
             reverse("apply_step5", args=[app_id]), edited, follow=True
         )
         app.refresh_from_db()
-        self.assertEqual(app.data["step5-student"]["last_name"], "Builder-Prime")
+        self.assertEqual(
+            ApplicationStudentDraft.objects.get(application=app).last_name,
+            "Builder-Prime",
+        )
         # Editing an earlier step must NOT clobber later steps' data.
         self.assertEqual(
-            app.data["step6-experience"]["interest_reason"], "Loves building things"
-        )
-        self.assertEqual(app.data["step7-primaryparent"]["legal_first_name"], "Pat")
-
-        # Step 6 must still show the saved answer, then forward again.
-        response = self.client.get(reverse("apply_step6", args=[app_id]))
-        self.assertEqual(
-            response.context["form"].initial.get("interest_reason"),
+            structured_fixed_experience_answers(app)["interest_reason"],
             "Loves building things",
         )
+        self.assertEqual(
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.PRIMARY
+            ).legal_first_name,
+            "Pat",
+        )
+
+        # Step 6 must still show the saved answer, then forward again.
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        self.assertEqual(
+            step6_get.context["form"].initial.get("interest_reason"),
+            "Loves building things",
+        )
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
             reverse("apply_step6", args=[app_id]),
             {
+                "experience_version": step6_token,
                 "interest_reason": "Loves building things",
                 "prior_robotics_experience": "Some motors",
             },
@@ -569,15 +640,25 @@ class ApplicationIntegrationFlowTests(TestCase):
         self.assertStepSuccess(response, app, 10)
         app.refresh_from_db()
         self.assertEqual(app.status, Application.Status.SUBMITTED)
-        self.assertEqual(app.data["step5-student"]["last_name"], "Builder-Prime")
         self.assertEqual(
-            app.data["step6-experience"]["interest_reason"], "Loves building things"
+            ApplicationStudentDraft.objects.get(application=app).last_name,
+            "Builder-Prime",
+        )
+        fixed_answers = structured_fixed_experience_answers(app)
+        self.assertEqual(fixed_answers["interest_reason"], "Loves building things")
+        self.assertEqual(fixed_answers["prior_robotics_experience"], "Some motors")
+        self.assertEqual(
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.PRIMARY
+            ).legal_first_name,
+            "Pat",
         )
         self.assertEqual(
-            app.data["step6-experience"]["prior_robotics_experience"], "Some motors"
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.SECONDARY
+            ).legal_first_name,
+            "Mary",
         )
-        self.assertEqual(app.data["step7-primaryparent"]["legal_first_name"], "Pat")
-        self.assertEqual(app.data["step8-secondaryparent"]["legal_first_name"], "Mary")
         self.assertEqual(app.program_id, self.program.pk)
 
     def test_student_flow_survives_multistep_back_and_forward(self):
@@ -640,8 +721,12 @@ class ApplicationIntegrationFlowTests(TestCase):
             "interest_reason": "I love robots",
             "hoped_gains": "Programming skills",
         }
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
-            reverse("apply_step6", args=[app_id]), step6_data, follow=True
+            reverse("apply_step6", args=[app_id]),
+            dict(step6_data, experience_version=step6_token),
+            follow=True,
         )
         self.assertStepSuccess(response, app, 7)
 
@@ -730,16 +815,29 @@ class ApplicationIntegrationFlowTests(TestCase):
             reverse("apply_step5", args=[app_id]), edited, follow=True
         )
         app.refresh_from_db()
-        self.assertEqual(app.data["step5-student"]["last_name"], "Lovelace-Byron")
+        self.assertEqual(
+            ApplicationStudentDraft.objects.get(application=app).last_name,
+            "Lovelace-Byron",
+        )
         # Editing the student-owned step must NOT clobber the parent-owned
         # steps (or the experience answers).
         self.assertEqual(
-            app.data["step6-experience"]["interest_reason"], "I love robots"
+            structured_fixed_experience_answers(app)["interest_reason"],
+            "I love robots",
         )
-        self.assertEqual(app.data["step7-primaryparent"]["legal_first_name"], "Pat")
+        self.assertEqual(
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.PRIMARY
+            ).legal_first_name,
+            "Pat",
+        )
 
+        step6_get = self.client.get(reverse("apply_step6", args=[app_id]))
+        step6_token = step6_get.context["form"].initial["experience_version"]
         response = self.client.post(
-            reverse("apply_step6", args=[app_id]), step6_data, follow=True
+            reverse("apply_step6", args=[app_id]),
+            dict(step6_data, experience_version=step6_token),
+            follow=True,
         )
         response = self.client.post(
             reverse("apply_step7", args=[app_id]), primary_parent_data, follow=True
@@ -762,15 +860,25 @@ class ApplicationIntegrationFlowTests(TestCase):
         self.assertStepSuccess(response, app, 10)
         app.refresh_from_db()
         self.assertEqual(app.status, Application.Status.SUBMITTED)
-        self.assertEqual(app.data["step5-student"]["last_name"], "Lovelace-Byron")
         self.assertEqual(
-            app.data["step6-experience"]["interest_reason"], "I love robots"
+            ApplicationStudentDraft.objects.get(application=app).last_name,
+            "Lovelace-Byron",
+        )
+        fixed_answers = structured_fixed_experience_answers(app)
+        self.assertEqual(fixed_answers["interest_reason"], "I love robots")
+        self.assertEqual(fixed_answers["hoped_gains"], "Programming skills")
+        self.assertEqual(
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.PRIMARY
+            ).legal_first_name,
+            "Pat",
         )
         self.assertEqual(
-            app.data["step6-experience"]["hoped_gains"], "Programming skills"
+            ApplicationGuardianDraft.objects.get(
+                application=app, slot=ApplicationGuardianDraft.Slot.SECONDARY
+            ).legal_first_name,
+            "Mary",
         )
-        self.assertEqual(app.data["step7-primaryparent"]["legal_first_name"], "Pat")
-        self.assertEqual(app.data["step8-secondaryparent"]["legal_first_name"], "Mary")
         self.assertEqual(app.program_id, self.program.pk)
 
     def test_mentor_flow_survives_multistep_back_and_forward(self):

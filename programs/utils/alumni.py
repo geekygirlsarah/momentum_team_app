@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from ..models import Adult
+from .email_coordination import claim_profile_emails
 
 
 def find_matching_alumni_adult(student):
@@ -92,6 +93,14 @@ def convert_student_to_alumni(student):
         raise ValidationError(
             "A student organization is required for alumni conversion."
         )
+
+    # Coordinate with other profile-email writers (the application wizard,
+    # staff forms, imports, merges) before reading/writing the alumni
+    # adult's email, so a concurrent writer for the same organization/email
+    # can't interleave with this conversion.
+    claim_profile_emails(
+        student.organization, [student.personal_email, student.org_email]
+    )
 
     adult = find_matching_alumni_adult(student)
     if adult is not None and adult.student_record_id not in (None, student.pk):

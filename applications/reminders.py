@@ -38,7 +38,7 @@ from .services import (
 logger = logging.getLogger(__name__)
 
 INACTIVITY_DELAY = timedelta(hours=48)
-DEADLINE_WINDOW = timedelta(days=2)
+DEADLINE_WINDOW = timedelta(days=3)
 MAX_BATCH_SIZE = 1000
 
 _DRAFT_STATUSES = (
@@ -252,6 +252,21 @@ def _candidate_queryset(organization, now):
             **{"data__step7-primaryparent__email__gt": ""},
         )
         | Q(applicant_type=Application.Type.STUDENT, data__step7__email__gt="")
+        # profile_workflow_version=1 student applications never populate the
+        # JSON step7 paths above; their guardian contact lives on the typed,
+        # linked primary guardian profile instead (see
+        # applications.services.document_recipient, which this mirrors).
+        | (
+            Q(
+                profile_workflow_version=1,
+                applicant_type=Application.Type.STUDENT,
+                primary_guardian_profile__isnull=False,
+            )
+            & (
+                Q(primary_guardian_profile__personal_email__gt="")
+                | Q(primary_guardian_profile__org_email__gt="")
+            )
+        )
     )
 
     submitted_upload = ApplicationDocumentSubmission.objects.filter(

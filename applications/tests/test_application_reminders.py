@@ -91,17 +91,17 @@ class ApplicationReminderTests(TestCase):
         legacy_due = self.run_batch(now=now, dry_run=True)
         self.assertEqual(legacy_due["planned"], 1)
 
-    def test_deadline_is_due_only_in_the_final_two_open_date_days(self):
+    def test_deadline_is_due_only_in_the_final_three_open_date_days(self):
         now = timezone.now()
         application = self.make_application(program=self.program)
         self.set_progress(application, now - timedelta(hours=1))
 
-        self.program.applications_close = now.date() + timedelta(days=3)
+        self.program.applications_close = now.date() + timedelta(days=4)
         self.program.save(update_fields=["applications_close", "updated_at"])
         not_due = self.run_batch(now=now, dry_run=True)
         self.assertEqual(not_due["planned"], 0)
 
-        self.program.applications_close = now.date() + timedelta(days=2)
+        self.program.applications_close = now.date() + timedelta(days=3)
         self.program.save(update_fields=["applications_close", "updated_at"])
         due = self.run_batch(now=now, dry_run=True)
         self.assertEqual(due["planned"], 1)
@@ -505,13 +505,13 @@ class ApplicationReminderTests(TestCase):
         now = timezone.now()
         application = self.make_application(program=self.program)
         self.set_progress(application, now - timedelta(hours=1))
-        self.program.applications_close = now.date() + timedelta(days=2)
+        self.program.applications_close = now.date() + timedelta(days=3)
         self.program.save(update_fields=["applications_close", "updated_at"])
         claim_plan = reminders._claim_plan
 
         def change_deadline_before_claim(organization, application_pk, observed_at):
             Program.objects.filter(pk=self.program.pk).update(
-                applications_close=observed_at.date() + timedelta(days=3)
+                applications_close=observed_at.date() + timedelta(days=4)
             )
             return claim_plan(organization, application_pk, observed_at)
 

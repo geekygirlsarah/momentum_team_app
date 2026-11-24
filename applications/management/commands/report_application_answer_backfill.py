@@ -21,6 +21,26 @@ class Command(BaseCommand):
         organization = Organization.objects.filter(slug=options["organization"]).first()
         if organization is None:
             raise CommandError("Organization not found.")
+        # This report's "no linked student" / "malformed answer data" checks
+        # are written against the legacy JSON data and ``converted_student``
+        # link; a profile-workflow (version 1) application is finalized onto
+        # ``student_profile`` instead and never sets ``converted_student``,
+        # so it would always be misreported here. Skip those rather than
+        # produce false positives; they're reviewed through the typed
+        # profile-workflow review screen instead.
+        skipped_profile_workflow = (
+            Application.objects.for_organization(organization)
+            .filter(
+                status__in=(
+                    Application.Status.APPROVED,
+                    Application.Status.APPROVED_SIGNED,
+                    Application.Status.CONVERTED,
+                ),
+                profile_workflow_version=1,
+            )
+            .exclude(applicant_type=Application.Type.MENTOR)
+            .count()
+        )
         applications = (
             Application.objects.for_organization(organization)
             .filter(
@@ -28,7 +48,8 @@ class Command(BaseCommand):
                     Application.Status.APPROVED,
                     Application.Status.APPROVED_SIGNED,
                     Application.Status.CONVERTED,
-                )
+                ),
+                profile_workflow_version=0,
             )
             .exclude(applicant_type=Application.Type.MENTOR)
             .select_related("converted_student", "program")
@@ -104,3 +125,9 @@ class Command(BaseCommand):
             self.stdout.write(f"{application.application_id}: {reason}")
             count += 1
         self.stdout.write(f"Applications requiring review: {count}")
+        if skipped_profile_workflow:
+            self.stdout.write(
+                f"Skipped {skipped_profile_workflow} profile-workflow "
+                "(version 1) application(s); review those through the "
+                "typed profile-workflow review screen instead."
+            )

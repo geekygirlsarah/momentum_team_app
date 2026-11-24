@@ -23,6 +23,7 @@ from programs.constants import OTP_TTL_SECONDS
 from programs.models import ProgramDocument
 
 from ..forms import DocumentSubmissionForm, OtpVerifyForm
+from ..identity_sync import touch_identity_proposal_baselines
 from ..models import Application, ApplicationDocumentSubmission, generate_otp_code
 from ..rate_limiting import check_otp_send_limit, check_otp_verify_limit
 from ..services import (
@@ -185,6 +186,8 @@ class Step10DocumentsView(View):
                     current.status = Application.Status.APPROVED_SIGNED
                     update_fields.append("status")
                 current.save(update_fields=update_fields)
+                if current.profile_workflow_version == 1:
+                    touch_identity_proposal_baselines(current, using=using)
                 application = current
         except SuspiciousFileOperation:
             messages.error(

@@ -541,11 +541,15 @@ class Adult(models.Model):
 
         from .students import Student
 
-        # Parents can have duplicate emails with each other, but not with students.
+        # Parents can have duplicate emails with each other, but not with students,
+        # within the same organization. Different organizations are entirely
+        # separate tenants, so a shared email across organizations is neither
+        # a conflict nor something this check should reveal.
         if self.personal_email:
             email = self.personal_email.strip().lower()
             if Student.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             ).exists():
                 raise ValidationError(
                     {"personal_email": "This email is already in use by a student."}
@@ -554,7 +558,8 @@ class Adult(models.Model):
         if self.org_email:
             email = self.org_email.strip().lower()
             if Student.all_objects.filter(
-                Q(personal_email__iexact=email) | Q(org_email__iexact=email)
+                Q(personal_email__iexact=email) | Q(org_email__iexact=email),
+                organization_id=self.organization_id,
             ).exists():
                 raise ValidationError(
                     {"org_email": "This email is already in use by a student."}

@@ -4,6 +4,7 @@ import string
 from django.test import TestCase
 
 from programs.models import Adult, Student
+from programs.models.email_claims import ProfileEmailClaim
 from programs.utils import (
     convert_student_to_alumni,
     find_matching_alumni_adult,
@@ -140,4 +141,16 @@ class AlumniConversionTests(TestCase):
         self.assertFalse(marked2)
         self.assertEqual(
             Adult.objects.filter(personal_email="sam@example.com").count(), 1
+        )
+
+    def test_convert_student_to_alumni_claims_email_for_coordination(self):
+        """Conversion must take the cross-writer email lock so a concurrent
+        writer (e.g. the application wizard) can't race it."""
+        student = self._make_student(personal_email="sam@example.com")
+        adult, _, _ = convert_student_to_alumni(student)
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=adult.organization,
+                normalized_email="sam@example.com",
+            ).exists()
         )

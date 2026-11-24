@@ -8,6 +8,7 @@ from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 
+from applications.models import Application
 from attendance.models import AttendanceEvent, AttendanceSession, RFIDCard
 from audit.events import AuditEvent
 from audit.models import AuditLog
@@ -130,6 +131,41 @@ class ParentMergeTest(TestCase):
             ).exists()
         )
 
+    def test_merge_transfers_profile_workflow_guardian_links(self):
+        """A profile-workflow application's links to the isolated guardian
+        profiles it activated must follow the merge, not silently go NULL."""
+        keep = self._parent("Jane", "Doe")
+        source = self._parent("Janet", "Doe")
+        program = Program.objects.create(
+            name="Test Program", start_date=timezone.localdate()
+        )
+
+        primary_app = Application.objects.create(
+            applicant_type=Application.Type.PARENT,
+            program=program,
+            email="primary@example.com",
+            profile_workflow_version=1,
+            primary_guardian_profile=source,
+        )
+        secondary_app = Application.objects.create(
+            applicant_type=Application.Type.PARENT,
+            program=program,
+            email="secondary@example.com",
+            profile_workflow_version=1,
+            secondary_guardian_profile=source,
+        )
+
+        response = self.client.post(
+            reverse("parent_merge"),
+            {"keep": keep.pk, "source": source.pk},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        primary_app.refresh_from_db()
+        secondary_app.refresh_from_db()
+        self.assertEqual(primary_app.primary_guardian_profile, keep)
+        self.assertEqual(secondary_app.secondary_guardian_profile, keep)
+
     def test_merge_preserves_keep_fields(self):
         keep = self._parent("Jane", "Doe", personal_email="jane@example.com")
         source = self._parent("Janet", "Doe", personal_email="janet@example.com")
@@ -142,6 +178,33 @@ class ParentMergeTest(TestCase):
 
         keep.refresh_from_db()
         self.assertEqual(keep.personal_email, "jane@example.com")
+
+    def test_merge_claims_both_emails_for_coordination(self):
+        """Merging must take the cross-writer email lock for both records'
+        emails, so a concurrent writer (e.g. the application wizard) can't
+        race it for the same organization/email."""
+        from programs.models.email_claims import ProfileEmailClaim
+
+        keep = self._parent("Jane", "Doe", personal_email="jane@example.com")
+        source = self._parent("Janet", "Doe", personal_email="janet@example.com")
+
+        response = self.client.post(
+            reverse("parent_merge"),
+            {"keep": keep.pk, "source": source.pk},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        org = Organization.objects.get(slug="gos")
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=org, normalized_email="jane@example.com"
+            ).exists()
+        )
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=org, normalized_email="janet@example.com"
+            ).exists()
+        )
 
     def test_merge_fills_missing_keep_fields_from_source(self):
         keep = self._parent("Jane", "Doe", phone_number="555-1234")

@@ -26,8 +26,13 @@ from ..answers import (
     build_custom_question_snapshot,
     experience_form_version,
     freeze_custom_question_snapshot,
+    freeze_structured_question_set,
+    structured_experience_form_version,
+    structured_fixed_experience_answers,
+    structured_question_snapshot,
     switch_custom_question_snapshot,
     validate_custom_question_snapshot,
+    validate_structured_application_answers,
 )
 from ..forms import (
     NOT_LISTED_SCHOOL,
@@ -41,9 +46,21 @@ from ..forms import (
     StudentExperienceForm,
     StudentInfoForm,
 )
+from ..identity_sync import (
+    sync_guardian_identity,
+    sync_guardian_relationship_proposal,
+    sync_student_identity,
+    touch_identity_proposal_baselines,
+)
 from ..models import (
     Application,
     ApplicationDocumentSubmission,
+    ApplicationFixedAnswer,
+    ApplicationGuardianDraft,
+    ApplicationQuestionAnswer,
+    ApplicationQuestionSet,
+    ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
     OtpVerifyResult,
     normalize_step_keys,
 )
@@ -118,6 +135,96 @@ def _student_email_context(application):
     return {
         email.strip().casefold() for email in get_student_emails(application) if email
     }
+
+
+_GUARDIAN_DRAFT_INITIAL_FIELDS = (
+    "legal_first_name",
+    "preferred_first_name",
+    "last_name",
+    "pronouns",
+    "relationship_to_student",
+    "specific_relationship",
+    "email",
+    "address",
+    "city",
+    "state",
+    "zip_code",
+    "phone_number",
+    "phone_type",
+    "can_receive_texts",
+    "email_updates",
+)
+
+
+def _present_guardian_draft(application, slot, using=None):
+    """Return the present typed guardian draft for ``slot``, if any."""
+    return (
+        ApplicationGuardianDraft.objects.using(using or "default")
+        .filter(
+            application=application,
+            slot=slot,
+            presence=ApplicationGuardianDraft.Presence.PRESENT,
+        )
+        .first()
+    )
+
+
+def _guardian_draft_initial(application, slot):
+    draft = _present_guardian_draft(application, slot)
+    if draft is None:
+        return {}
+    return {
+        field: value
+        for field in _GUARDIAN_DRAFT_INITIAL_FIELDS
+        if (value := getattr(draft, field)) not in (None, "")
+    }
+
+
+_STUDENT_DRAFT_DISPLAY_FIELDS = (
+    "legal_first_name",
+    "preferred_first_name",
+    "last_name",
+    "pronouns",
+    "date_of_birth",
+    "address",
+    "city",
+    "state",
+    "zip_code",
+    "personal_email",
+    "phone_number",
+    "phone_type",
+    "can_receive_texts",
+    "directory_consent",
+    "grade",
+    "tshirt_size",
+    "allergies",
+    "dietary_restrictions",
+    "medical_notes",
+)
+
+
+def _student_draft_display_fields(draft):
+    """Return a JSON-legacy-shaped dict of a typed student draft's answered
+    fields, for prefill (Step 5) and read-only display (Step 9)."""
+    fields = {
+        field: value
+        for field in _STUDENT_DRAFT_DISPLAY_FIELDS
+        if (value := getattr(draft, field)) not in (None, "")
+    }
+    if draft.school_not_listed:
+        fields["school_name"] = NOT_LISTED_SCHOOL
+    elif draft.school_name:
+        fields["school_name"] = draft.school_name
+    if draft.pk:
+        fields["race_ethnicities"] = list(
+            draft.race_ethnicities.values_list("pk", flat=True)
+        )
+    return fields
+
+
+def _guardian_draft_email(application, slot):
+    draft = _present_guardian_draft(application, slot)
+    return (draft.email or "") if draft is not None else ""
 
 
 def _application_student_for_prefill(application):
@@ -961,6 +1068,11 @@ class Step5StudentInfoView(View):
                     program_start_date=program_start_date,
                 )
 
+        if application.profile_workflow_version == 1:
+            return self._post_structured(
+                request, application, form, picker, chosen_student, program_start_date
+            )
+
         payload = _sanitize_payload(form.cleaned_data)
         # Turn the "My school isn't listed" option into a flag so we don't
         # persist the sentinel value as a school name.
@@ -1069,6 +1181,132 @@ class Step5StudentInfoView(View):
 
         return redirect("apply_step6", app_id=application.application_id)
 
+    def _post_structured(
+        self, request, application, form, picker, chosen_student, program_start_date
+    ):
+        using = application._state.db
+        cleaned = form.cleaned_data
+        with transaction.atomic(using=using):
+            current = _locked_application_queryset(
+                using, application.pk, application.organization_id
+            ).first()
+            if current is None:
+                return redirect("apply_start")
+            guard = _step_write_guard(request, current, application)
+            if guard is not None:
+                return guard
+            if current.program_id != application.program_id:
+                form.add_error(
+                    None,
+                    "The selected program changed while this form was being saved. "
+                    "Please review the student information and submit it again.",
+                )
+                return self._render(
+                    request,
+                    current,
+                    form,
+                    picker,
+                    chosen_student,
+                    program_start_date=(
+                        current.program.start_date if current.program else None
+                    ),
+                )
+            current_chosen_student, current_picker = self._existing_student_picker(
+                current, request.POST
+            )
+            if getattr(current_chosen_student, "pk", None) != getattr(
+                chosen_student, "pk", None
+            ):
+                form.add_error(
+                    None,
+                    "The selected student record changed while this form was being "
+                    "saved. Please review the selection and submit it again.",
+                )
+                return self._render(
+                    request,
+                    current,
+                    form,
+                    current_picker,
+                    current_chosen_student,
+                    program_start_date=(
+                        current.program.start_date if current.program else None
+                    ),
+                )
+
+            school_name = cleaned.get("school_name") or ""
+            school_not_listed = school_name == NOT_LISTED_SCHOOL
+            grade = cleaned.get("grade")
+            ref_date = current.program.start_date if current.program else None
+            graduation_year = cleaned.get("graduation_year") or (
+                calculate_graduation_year(grade, ref_date) if grade else None
+            )
+            draft, _created = ApplicationStudentDraft.objects.using(
+                using
+            ).update_or_create(
+                application=current,
+                defaults=dict(
+                    organization=current.organization,
+                    legal_first_name=cleaned.get("legal_first_name") or "",
+                    preferred_first_name=cleaned.get("preferred_first_name") or "",
+                    last_name=cleaned.get("last_name") or "",
+                    pronouns=cleaned.get("pronouns") or "",
+                    date_of_birth=cleaned.get("date_of_birth"),
+                    confirm_age=bool(cleaned.get("confirm_age")),
+                    address=cleaned.get("address") or "",
+                    city=cleaned.get("city") or "",
+                    state=cleaned.get("state") or "",
+                    zip_code=cleaned.get("zip_code") or "",
+                    personal_email=cleaned.get("personal_email") or "",
+                    phone_number=cleaned.get("phone_number") or "",
+                    phone_type=cleaned.get("phone_type") or "",
+                    can_receive_texts=bool(cleaned.get("can_receive_texts")),
+                    directory_consent=bool(cleaned.get("directory_consent")),
+                    school_name="" if school_not_listed else school_name,
+                    school_not_listed=school_not_listed,
+                    grade=int(grade) if grade else None,
+                    confirm_grade=bool(cleaned.get("confirm_grade")),
+                    graduation_year=graduation_year,
+                    tshirt_size=cleaned.get("tshirt_size") or "",
+                    allergies=cleaned.get("allergies") or "",
+                    allergies_answered=True,
+                    dietary_restrictions=cleaned.get("dietary_restrictions") or "",
+                    dietary_restrictions_answered=True,
+                    medical_notes=cleaned.get("medical_notes") or "",
+                    medical_notes_answered=True,
+                ),
+            )
+            race_ethnicities = cleaned.get("race_ethnicities")
+            if race_ethnicities is not None:
+                selected_ids = set(race_ethnicities.values_list("pk", flat=True))
+                links = ApplicationStudentDraftRaceEthnicity.objects.using(
+                    using
+                ).filter(student_draft=draft)
+                existing_ids = set(links.values_list("race_ethnicity_id", flat=True))
+                links.filter(race_ethnicity_id__in=existing_ids - selected_ids).delete()
+                for race_id in selected_ids - existing_ids:
+                    ApplicationStudentDraftRaceEthnicity.objects.using(using).create(
+                        organization=current.organization,
+                        student_draft=draft,
+                        race_ethnicity_id=race_id,
+                    )
+
+            sync_student_identity(
+                current,
+                draft,
+                request=request,
+                existing_student=chosen_student,
+                using=using,
+            )
+
+            current.current_step = max(current.current_step, 6)
+            current.applicant_progress_at = timezone.now()
+            current.save(
+                using=using,
+                update_fields=["current_step", "applicant_progress_at", "updated_at"],
+            )
+            touch_identity_proposal_baselines(current, using=using)
+        return redirect("apply_step6", app_id=application.application_id)
+
     def _existing_student_picker(self, application, post=None):
         """Return (chosen_student, picker_form_or_None)."""
         if application.applicant_type != Application.Type.PARENT:
@@ -1113,6 +1351,15 @@ class Step5StudentInfoView(View):
                 if grade is not None:
                     initial["grade"] = grade
             return initial
+        if application.profile_workflow_version == 1:
+            draft = ApplicationStudentDraft.objects.filter(
+                application=application
+            ).first()
+            if draft is not None:
+                return _student_draft_display_fields(draft)
+            if application.applicant_type == Application.Type.STUDENT:
+                return {"personal_email": application.email}
+            return {}
         return _student_initial_for(application)
 
     def _render(
@@ -1184,7 +1431,16 @@ class Step6ExperienceView(View):
             return guard
 
         snapshot, version, error = self._prepare_question_state(application)
-        initial = normalize_step_keys(application.data).get("step6-experience") or {}
+        if application.profile_workflow_version == 1:
+            try:
+                initial = structured_fixed_experience_answers(application)
+            except ValueError as exc:
+                initial = {}
+                error = str(exc)
+        else:
+            initial = (
+                normalize_step_keys(application.data).get("step6-experience") or {}
+            )
         initial["experience_version"] = version
         form = StudentExperienceForm(
             initial=initial,
@@ -1205,7 +1461,9 @@ class Step6ExperienceView(View):
         if guard is not None:
             return guard
 
-        snapshot, version, state_error = self._prepare_question_state(application)
+        snapshot, version, state_error = self._prepare_question_state(
+            application, freeze_structured=False
+        )
         form = StudentExperienceForm(
             request.POST,
             applicant_type=application.applicant_type,
@@ -1217,6 +1475,14 @@ class Step6ExperienceView(View):
             return self._render(request, application, form)
         if not form.is_valid():
             return self._render(request, application, form)
+        if application.profile_workflow_version == 1:
+            return self._post_structured(
+                request,
+                application,
+                form,
+                version,
+                form.answered_snapshot(),
+            )
         current_data = application.data or {}
         needs_version = bool(snapshot) or bool(current_data.get("step6-experience"))
         posted_version = request.POST.get("experience_version", "")
@@ -1284,9 +1550,22 @@ class Step6ExperienceView(View):
         return redirect("apply_step7", app_id=application.application_id)
 
     @staticmethod
-    def _prepare_question_state(application):
+    def _prepare_question_state(application, freeze_structured=True):
         snapshot = []
         try:
+            if application.profile_workflow_version == 1:
+                if freeze_structured:
+                    snapshot = freeze_structured_question_set(application)
+                    application.refresh_from_db()
+                else:
+                    snapshot = structured_question_snapshot(application)
+                    if snapshot is None:
+                        raise ValueError(
+                            "The program changed or its question set is not loaded. "
+                            "Reload this page before continuing."
+                        )
+                version = structured_experience_form_version(application)
+                return snapshot, version, None
             if application.program_id:
                 snapshot = freeze_custom_question_snapshot(application)
                 application.refresh_from_db()
@@ -1294,6 +1573,133 @@ class Step6ExperienceView(View):
             return snapshot, version, None
         except ValueError as exc:
             return [], "", str(exc)
+
+    def _post_structured(self, request, application, form, version, answered_snapshot):
+        using = application._state.db
+        posted_version = request.POST.get("experience_version", "")
+        fixed_answers = {
+            key: value
+            for key, value in form.cleaned_data.items()
+            if key
+            in (
+                "interest_reason",
+                "hoped_gains",
+                "prior_robotics_experience",
+                "referral_source",
+            )
+        }
+        with transaction.atomic(using=using):
+            current = _locked_application_queryset(
+                using, application.pk, application.organization_id
+            ).first()
+            if current is None:
+                return redirect("apply_start")
+            guard = _step_write_guard(request, current, application)
+            if guard is not None:
+                return guard
+            if (
+                current.profile_workflow_version != application.profile_workflow_version
+                or current.profile_workflow_version != 1
+            ):
+                form.add_error(
+                    None,
+                    "The application workflow changed while this form was open. "
+                    "Reload the page before continuing.",
+                )
+                return self._render(request, current, form)
+            if current.program_id != application.program_id:
+                form.add_error(
+                    None,
+                    "The selected program changed while this form was being saved. "
+                    "Please review your answers and submit them again.",
+                )
+                return self._render(request, current, form)
+            try:
+                current_version = structured_experience_form_version(
+                    current, using=using, lock=True
+                )
+            except ValueError as exc:
+                form.add_error(None, str(exc))
+                return self._render(request, current, form)
+            if not constant_time_compare(
+                posted_version, version
+            ) or not constant_time_compare(current_version, version):
+                form.add_error(
+                    None,
+                    "Your application answers changed after you opened this page. "
+                    "Your entries are still shown but were not saved. Reload the page "
+                    "before trying again.",
+                )
+                return self._render(request, current, form)
+            try:
+                current_snapshot = structured_question_snapshot(current, using=using)
+                if current_snapshot is None:
+                    raise ValueError("Program-specific questions have not been frozen.")
+                if set(fixed_answers) != {
+                    "interest_reason",
+                    "hoped_gains",
+                    "prior_robotics_experience",
+                    "referral_source",
+                } or any(
+                    not isinstance(value, str) for value in fixed_answers.values()
+                ):
+                    raise ValueError("Fixed application answers are malformed.")
+                submitted = {item["question_id"]: item for item in answered_snapshot}
+                if len(submitted) != len(current_snapshot) or any(
+                    item["question_id"] not in submitted
+                    or submitted[item["question_id"]].get("question_text")
+                    != item["question_text"]
+                    or submitted[item["question_id"]].get("required")
+                    is not item["required"]
+                    or not isinstance(submitted[item["question_id"]].get("answer"), str)
+                    for item in current_snapshot
+                ):
+                    raise ValueError("The frozen application question set changed.")
+                question_set = ApplicationQuestionSet._base_manager.using(using).get(
+                    application_id=current.pk,
+                    organization_id=current.organization_id,
+                    program_id=current.program_id,
+                )
+                question_answers = list(
+                    ApplicationQuestionAnswer._base_manager.using(using)
+                    .filter(question_set_id=question_set.pk)
+                    .order_by("position", "pk")
+                    .select_for_update()
+                )
+                if len(question_answers) != len(current_snapshot):
+                    raise ValueError("The frozen application question set changed.")
+                submitted_by_id = {
+                    str(item["question_id"]): item for item in answered_snapshot
+                }
+                for row, frozen_item in zip(question_answers, current_snapshot):
+                    posted = submitted_by_id.get(str(row.question_id))
+                    if (
+                        posted is None
+                        or row.organization_id != current.organization_id
+                        or row.question_text != frozen_item["question_text"]
+                        or row.is_required != frozen_item["required"]
+                    ):
+                        raise ValueError("The frozen application question set changed.")
+                for key, answer in fixed_answers.items():
+                    ApplicationFixedAnswer.objects.using(using).update_or_create(
+                        organization_id=current.organization_id,
+                        application_id=current.pk,
+                        source_step="step6-experience",
+                        question_key=key,
+                        defaults={"answer": answer},
+                    )
+                for row in question_answers:
+                    row.answer = submitted_by_id[str(row.question_id)]["answer"]
+                    row.save(using=using, update_fields=["answer"])
+            except ValueError as exc:
+                form.add_error(None, str(exc))
+                return self._render(request, current, form)
+            current.current_step = max(current.current_step, 7)
+            current.applicant_progress_at = timezone.now()
+            current.save(
+                update_fields=["current_step", "applicant_progress_at", "updated_at"]
+            )
+        return redirect("apply_step7", app_id=application.application_id)
 
     def _render(self, request, application, form):
         return render(
@@ -1456,6 +1862,12 @@ class Step7PrimaryParentView(View):
             return self._render(
                 request, application, form, handoff_form, mode, existing_adult
             )
+
+        if application.profile_workflow_version == 1:
+            return self._post_structured(
+                request, application, form, handoff_form, mode, existing_adult
+            )
+
         payload = _sanitize_payload(form.cleaned_data)
 
         student_email_context = _student_email_context(application)
@@ -1498,6 +1910,79 @@ class Step7PrimaryParentView(View):
             return response
         return redirect("apply_step8", app_id=application.application_id)
 
+    def _post_structured(
+        self, request, application, form, handoff_form, mode, existing_adult
+    ):
+        using = application._state.db
+        cleaned = form.cleaned_data
+        with transaction.atomic(using=using):
+            current = get_object_or_404(
+                _locked_application_queryset(
+                    using, application.pk, application.organization_id
+                )
+            )
+            guard = _step_write_guard(request, current, application)
+            if guard is not None:
+                return guard
+            if current.program_id != application.program_id:
+                form.add_error(
+                    None,
+                    "The selected program changed while this form was being saved. "
+                    "Please review the contact information and submit it again.",
+                )
+                return self._render(
+                    request, current, form, handoff_form, mode, existing_adult
+                )
+            student_draft = (
+                ApplicationStudentDraft.objects.using(using)
+                .filter(application=current)
+                .first()
+            )
+            guardian_draft, _created = ApplicationGuardianDraft.objects.using(
+                using
+            ).update_or_create(
+                application=current,
+                slot=ApplicationGuardianDraft.Slot.PRIMARY,
+                defaults=dict(
+                    organization=current.organization,
+                    presence=ApplicationGuardianDraft.Presence.PRESENT,
+                    legal_first_name=cleaned.get("legal_first_name") or "",
+                    preferred_first_name=cleaned.get("preferred_first_name") or "",
+                    last_name=cleaned.get("last_name") or "",
+                    pronouns=cleaned.get("pronouns") or "",
+                    relationship_to_student=cleaned.get("relationship_to_student")
+                    or "",
+                    specific_relationship=cleaned.get("specific_relationship") or "",
+                    email=cleaned.get("email") or "",
+                    address=cleaned.get("address") or "",
+                    city=cleaned.get("city") or "",
+                    state=cleaned.get("state") or "",
+                    zip_code=cleaned.get("zip_code") or "",
+                    phone_number=cleaned.get("phone_number") or "",
+                    phone_type=cleaned.get("phone_type") or "",
+                    can_receive_texts=bool(cleaned.get("can_receive_texts")),
+                    email_updates=bool(cleaned.get("email_updates")),
+                ),
+            )
+            sync_guardian_identity(
+                current, guardian_draft, request=request, using=using
+            )
+            if student_draft is not None:
+                sync_guardian_relationship_proposal(
+                    current,
+                    student_draft=student_draft,
+                    guardian_draft=guardian_draft,
+                    using=using,
+                )
+            current.current_step = max(current.current_step, 8)
+            current.applicant_progress_at = timezone.now()
+            current.save(
+                using=using,
+                update_fields=["current_step", "applicant_progress_at", "updated_at"],
+            )
+            touch_identity_proposal_baselines(current, using=using)
+        return redirect("apply_step8", app_id=application.application_id)
+
     def _build_forms(self, application, post=None):
         """Decide which form mode to show:
         - "handoff": student initiated and no parent email is on file yet,
@@ -1505,7 +1990,12 @@ class Step7PrimaryParentView(View):
         - "form": show the actual ParentInfoForm.
         Returns (form, handoff_form, mode).
         """
-        saved = (application.data or {}).get("step7-primaryparent") or {}
+        if application.profile_workflow_version == 1:
+            saved = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+        else:
+            saved = (application.data or {}).get("step7-primaryparent") or {}
         # If the student initiated and we don't have a parent yet, default to
         # asking for a handoff email — unless they're already filling out the
         # form (post with parent fields), or they previously entered parent
@@ -1541,9 +2031,14 @@ class Step7PrimaryParentView(View):
                 )
 
         student_emails = get_student_emails(application)
-        other_parent_email = (
-            (application.data or {}).get("step8-secondaryparent") or {}
-        ).get("email")
+        if application.profile_workflow_version == 1:
+            other_parent_email = _guardian_draft_email(
+                application, ApplicationGuardianDraft.Slot.SECONDARY
+            )
+        else:
+            other_parent_email = (
+                (application.data or {}).get("step8-secondaryparent") or {}
+            ).get("email")
         if student_initiated and not saved and not already_handed_off:
             # Student is applying — the parent still needs to take over.
             # If we already know the parent's email (returning student's
@@ -1623,7 +2118,12 @@ class Step7PrimaryParentView(View):
         # adult record (i.e., we're in form mode and the form is unbound, or
         # bound but came in with prefilled initial data). Don't show it if
         # the applicant has already saved step7 data in a previous visit.
-        saved = (application.data or {}).get("step7-primaryparent") or {}
+        if application.profile_workflow_version == 1:
+            saved = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+        else:
+            saved = (application.data or {}).get("step7-primaryparent") or {}
         if existing_adult is not None and not saved and mode == "form":
             display_name = (
                 existing_adult.preferred_first_name
@@ -1832,9 +2332,14 @@ class Step8SecondaryParentView(View):
             )
 
         student_emails = get_student_emails(application)
-        other_parent_email = (
-            (application.data or {}).get("step7-primaryparent") or {}
-        ).get("email")
+        if application.profile_workflow_version == 1:
+            other_parent_email = _guardian_draft_email(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+        else:
+            other_parent_email = (
+                (application.data or {}).get("step7-primaryparent") or {}
+            ).get("email")
         form = ParentInfoForm(
             initial=self._initial(application),
             require_email=False,
@@ -1858,9 +2363,14 @@ class Step8SecondaryParentView(View):
             )
 
         student_emails = get_student_emails(application)
-        other_parent_email = (
-            (application.data or {}).get("step7-primaryparent") or {}
-        ).get("email")
+        if application.profile_workflow_version == 1:
+            other_parent_email = _guardian_draft_email(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+        else:
+            other_parent_email = (
+                (application.data or {}).get("step7-primaryparent") or {}
+            ).get("email")
         form = ParentInfoForm(
             request.POST,
             require_email=False,
@@ -1870,6 +2380,9 @@ class Step8SecondaryParentView(View):
         )
         if not form.is_valid():
             return self._render(request, application, form)
+
+        if application.profile_workflow_version == 1:
+            return self._post_structured(request, application, form)
 
         payload = _sanitize_payload(form.cleaned_data)
 
@@ -1921,7 +2434,80 @@ class Step8SecondaryParentView(View):
             return response
         return redirect("apply_step9", app_id=application.application_id)
 
+    def _post_structured(self, request, application, form):
+        using = application._state.db
+        cleaned = form.cleaned_data
+        with transaction.atomic(using=using):
+            current = get_object_or_404(
+                _locked_application_queryset(
+                    using, application.pk, application.organization_id
+                )
+            )
+            guard = _step_write_guard(request, current, application)
+            if guard is not None:
+                return guard
+            if current.program_id != application.program_id:
+                form.add_error(
+                    None,
+                    "The selected program changed while this form was being saved. "
+                    "Please review the contact information and submit it again.",
+                )
+                return self._render(request, current, form)
+            student_draft = (
+                ApplicationStudentDraft.objects.using(using)
+                .filter(application=current)
+                .first()
+            )
+            guardian_draft, _created = ApplicationGuardianDraft.objects.using(
+                using
+            ).update_or_create(
+                application=current,
+                slot=ApplicationGuardianDraft.Slot.SECONDARY,
+                defaults=dict(
+                    organization=current.organization,
+                    presence=ApplicationGuardianDraft.Presence.PRESENT,
+                    legal_first_name=cleaned.get("legal_first_name") or "",
+                    preferred_first_name=cleaned.get("preferred_first_name") or "",
+                    last_name=cleaned.get("last_name") or "",
+                    pronouns=cleaned.get("pronouns") or "",
+                    relationship_to_student=cleaned.get("relationship_to_student")
+                    or "",
+                    specific_relationship=cleaned.get("specific_relationship") or "",
+                    email=cleaned.get("email") or "",
+                    address=cleaned.get("address") or "",
+                    city=cleaned.get("city") or "",
+                    state=cleaned.get("state") or "",
+                    zip_code=cleaned.get("zip_code") or "",
+                    phone_number=cleaned.get("phone_number") or "",
+                    phone_type=cleaned.get("phone_type") or "",
+                    can_receive_texts=bool(cleaned.get("can_receive_texts")),
+                    email_updates=bool(cleaned.get("email_updates")),
+                ),
+            )
+            sync_guardian_identity(
+                current, guardian_draft, request=request, using=using
+            )
+            if student_draft is not None:
+                sync_guardian_relationship_proposal(
+                    current,
+                    student_draft=student_draft,
+                    guardian_draft=guardian_draft,
+                    using=using,
+                )
+            current.current_step = max(current.current_step, 9)
+            current.applicant_progress_at = timezone.now()
+            current.save(
+                using=using,
+                update_fields=["current_step", "applicant_progress_at", "updated_at"],
+            )
+            touch_identity_proposal_baselines(current, using=using)
+        return redirect("apply_step9", app_id=application.application_id)
+
     def _initial(self, application):
+        if application.profile_workflow_version == 1:
+            return _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.SECONDARY
+            )
         saved = (application.data or {}).get("step8-secondaryparent") or {}
 
         # If we have actual form data, return it regardless of _skipped
@@ -2057,6 +2643,13 @@ class Step9ConfirmView(View):
                     "Please review the application before submitting again.",
                 )
                 return self._render(request, current, form)
+            if current.profile_workflow_version != application.profile_workflow_version:
+                form.add_error(
+                    None,
+                    "The application workflow changed while you were confirming. "
+                    "Please review the application before submitting again.",
+                )
+                return self._render(request, current, form)
 
             try:
                 snapshot, needs_question_step = self._confirmation_snapshot(current)
@@ -2066,17 +2659,32 @@ class Step9ConfirmView(View):
             if needs_question_step:
                 return redirect("apply_step6", app_id=current.application_id)
             try:
-                validate_custom_question_snapshot(snapshot, require_answers=True)
+                if current.profile_workflow_version == 1:
+                    validate_structured_application_answers(current, using=using)
+                else:
+                    validate_custom_question_snapshot(snapshot, require_answers=True)
             except ValueError as exc:
                 form.add_error(None, str(exc))
                 return self._render(request, current, form, custom_snapshot=snapshot)
 
             # Ensure at least one parent opted in to notifications.
-            data = current.data or {}
-            p1_opt = (data.get("step7-primaryparent") or {}).get("email_updates", False)
-            p2_opt = (data.get("step8-secondaryparent") or {}).get(
-                "email_updates", False
-            )
+            if current.profile_workflow_version == 1:
+                primary_draft = _present_guardian_draft(
+                    current, ApplicationGuardianDraft.Slot.PRIMARY, using=using
+                )
+                secondary_draft = _present_guardian_draft(
+                    current, ApplicationGuardianDraft.Slot.SECONDARY, using=using
+                )
+                p1_opt = bool(primary_draft and primary_draft.email_updates)
+                p2_opt = bool(secondary_draft and secondary_draft.email_updates)
+            else:
+                data = current.data or {}
+                p1_opt = (data.get("step7-primaryparent") or {}).get(
+                    "email_updates", False
+                )
+                p2_opt = (data.get("step8-secondaryparent") or {}).get(
+                    "email_updates", False
+                )
             if not p1_opt and not p2_opt:
                 form.add_error(
                     None,
@@ -2098,6 +2706,8 @@ class Step9ConfirmView(View):
                     "updated_at",
                 ]
             )
+            if current.profile_workflow_version == 1:
+                touch_identity_proposal_baselines(current, using=using)
             application = current
 
         try:
@@ -2132,6 +2742,11 @@ class Step9ConfirmView(View):
 
     @staticmethod
     def _confirmation_snapshot(application):
+        if application.profile_workflow_version == 1:
+            snapshot = structured_question_snapshot(application)
+            if snapshot is None:
+                return [], True
+            return snapshot, False
         data = application.data
         if not isinstance(data, dict):
             raise ValueError("Application answer data is malformed.")
@@ -2157,6 +2772,13 @@ class Step9ConfirmView(View):
     def _render(self, request, application, form, custom_snapshot=None):
         data = application.data if isinstance(application.data, dict) else {}
         custom_snapshot_error = None
+        step6_data = data.get("step6-experience") or {}
+        if application.profile_workflow_version == 1:
+            try:
+                step6_data = structured_fixed_experience_answers(application)
+            except ValueError as exc:
+                step6_data = {}
+                custom_snapshot_error = str(exc)
         if custom_snapshot is None:
             try:
                 custom_snapshot, needs_question_step = self._confirmation_snapshot(
@@ -2171,24 +2793,50 @@ class Step9ConfirmView(View):
             except ValueError as exc:
                 custom_snapshot = []
                 custom_snapshot_error = str(exc)
+
+        if application.profile_workflow_version == 1:
+            # Steps 5, 7 and 8 save typed drafts rather than JSON `data` for
+            # this version, so the review page reads the same typed records
+            # instead of (empty) legacy keys.
+            student_draft = ApplicationStudentDraft.objects.filter(
+                application=application
+            ).first()
+            step5_data = (
+                _student_draft_display_fields(student_draft)
+                if student_draft is not None
+                else {}
+            )
+            step5_school_not_listed = bool(
+                student_draft is not None and student_draft.school_not_listed
+            )
+            step7_data = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.PRIMARY
+            )
+            step8_data = _guardian_draft_initial(
+                application, ApplicationGuardianDraft.Slot.SECONDARY
+            )
+            step8_skipped = not step8_data
+        else:
+            step5_data = data.get("step5-student") or {}
+            step5_school_not_listed = bool(step5_data.get("_school_not_listed"))
+            step7_data = data.get("step7-primaryparent") or {}
+            step8_data = data.get("step8-secondaryparent") or {}
+            step8_skipped = bool(step8_data.get("_skipped"))
+
         return render(
             request,
             self.template_name,
             {
                 "application": application,
                 "form": form,
-                "step5_data": data.get("step5-student") or {},
-                "step6_data": data.get("step6-experience") or {},
+                "step5_data": step5_data,
+                "step6_data": step6_data,
                 "step6_custom_data": custom_snapshot,
                 "custom_snapshot_error": custom_snapshot_error,
-                "step7_data": data.get("step7-primaryparent") or {},
-                "step8_data": data.get("step8-secondaryparent") or {},
-                "step8_skipped": bool(
-                    (data.get("step8-secondaryparent") or {}).get("_skipped")
-                ),
-                "step5_school_not_listed": bool(
-                    (data.get("step5-student") or {}).get("_school_not_listed")
-                ),
+                "step7_data": step7_data,
+                "step8_data": step8_data,
+                "step8_skipped": step8_skipped,
+                "step5_school_not_listed": step5_school_not_listed,
                 "current_step": 9,
                 "total_steps": TOTAL_STEPS,
             },

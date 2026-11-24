@@ -7,12 +7,16 @@ from calendar_feeds.ics import _build_ics_response
 from calendar_feeds.models import EventException
 from calendar_feeds.tests.factories import make_event, make_feed
 from organizations.models import Organization
+from organizations.utils import update_organization_settings
 
 
 @override_settings(TIME_ZONE="America/New_York")
 class OccurrenceICSTests(TestCase):
     def setUp(self):
         self.feed = make_feed(slug="occurrences")
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/New_York"}
+        )
         self.start = datetime(2026, 3, 1, 10, tzinfo=ZoneInfo("America/New_York"))
         self.event = make_event(
             self.feed,
@@ -66,14 +70,14 @@ class OccurrenceICSTests(TestCase):
             new_description="New\ndescription",
         )
         master, moved, changed = self.components()
-        self.assertIn("EXDATE:20260308T150000Z", master)
+        self.assertIn("EXDATE;TZID=America/New_York:20260308T100000", master)
         self.assertIn(f"UID:{self.event.uid}", moved)
-        self.assertIn("RECURRENCE-ID:20260315T150000Z", moved)
+        self.assertIn("RECURRENCE-ID;TZID=America/New_York:20260315T100000", moved)
         self.assertIn("DTSTART;TZID=America/New_York:20260316T110000", moved)
         self.assertIn("DESCRIPTION:Original description", moved)
-        self.assertIn("RECURRENCE-ID:20260322T150000Z", changed)
-        self.assertIn("DTSTART;TZID=America/New_York:20260322T110000", changed)
-        self.assertIn("DTEND;TZID=America/New_York:20260322T130000", changed)
+        self.assertIn("RECURRENCE-ID;TZID=America/New_York:20260322T100000", changed)
+        self.assertIn("DTSTART;TZID=America/New_York:20260322T100000", changed)
+        self.assertIn("DTEND;TZID=America/New_York:20260322T120000", changed)
         self.assertIn("SUMMARY:Changed\\; title", changed)
         self.assertIn("DESCRIPTION:New\\ndescription", changed)
         self.assertIn("LOCATION:Original location", changed)
@@ -137,7 +141,7 @@ class OccurrenceICSTests(TestCase):
             ),
         )
         master, changed = self.components()
-        self.assertIn("EXDATE:20260315T150000Z", master)
+        self.assertIn("EXDATE;TZID=America/New_York:20260315T100000", master)
         self.assertNotIn("20260322", "\n".join(master))
         self.assertIn("SUMMARY:Valid", changed)
         self.assertEqual(self.event.exceptions.count(), 5)
@@ -167,7 +171,7 @@ class OccurrenceICSTests(TestCase):
         )
         components = self.components()
         self.assertEqual(len(components), 1)
-        self.assertIn("EXDATE:20260308T150000Z", components[0])
+        self.assertIn("EXDATE;TZID=America/New_York:20260308T100000", components[0])
 
     def test_utc_date_keys_across_midnight_and_dst(self):
         self.event.start_datetime = datetime(
@@ -192,12 +196,15 @@ class OccurrenceICSTests(TestCase):
             ),
         )
         master, changed, moved = self.components()
-        self.assertIn("DTSTART:20260302T043000Z", master)
-        self.assertIn("EXDATE:20260309T043000Z,20260316T043000Z", master)
-        self.assertIn("RECURRENCE-ID:20260323T043000Z", changed)
-        self.assertIn("DTSTART;TZID=America/New_York:20260323T003000", changed)
-        self.assertIn("DTEND;TZID=America/New_York:20260323T013000", changed)
-        self.assertIn("RECURRENCE-ID:20260330T043000Z", moved)
+        self.assertIn("DTSTART;TZID=America/New_York:20260301T233000", master)
+        self.assertIn(
+            "EXDATE;TZID=America/New_York:20260308T233000,20260315T233000",
+            master,
+        )
+        self.assertIn("RECURRENCE-ID;TZID=America/New_York:20260322T233000", changed)
+        self.assertIn("DTSTART;TZID=America/New_York:20260322T233000", changed)
+        self.assertIn("DTEND;TZID=America/New_York:20260323T003000", changed)
+        self.assertIn("RECURRENCE-ID;TZID=America/New_York:20260329T233000", moved)
 
     def test_utc_date_key_can_shift_to_previous_local_date_after_dst(self):
         self.event.start_datetime = datetime(
@@ -211,7 +218,34 @@ class OccurrenceICSTests(TestCase):
             date(2026, 3, 9), EventException.CHANGE_CHANGED, new_title="Changed"
         )
         master, changed = self.components()
-        self.assertIn("DTSTART:20260302T033000Z", master)
-        self.assertIn("RECURRENCE-ID:20260309T033000Z", changed)
-        self.assertIn("DTSTART;TZID=America/New_York:20260308T233000", changed)
-        self.assertIn("DTEND;TZID=America/New_York:20260309T003000", changed)
+        self.assertIn("DTSTART;TZID=America/New_York:20260301T223000", master)
+        self.assertIn("RECURRENCE-ID;TZID=America/New_York:20260308T223000", changed)
+        self.assertIn("DTSTART;TZID=America/New_York:20260308T223000", changed)
+        self.assertIn("DTEND;TZID=America/New_York:20260308T233000", changed)
+
+    def test_subscription_recurrence_uses_organization_timezone_across_dst(self):
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/Chicago"}
+        )
+        start = datetime(2026, 3, 1, 9, tzinfo=ZoneInfo("America/Chicago"))
+        event = make_event(
+            self.feed,
+            start_datetime=start,
+            end_datetime=start + timedelta(hours=1),
+            rrule_ical="FREQ=WEEKLY;COUNT=3",
+            exdate_ical="2026-03-08",
+        )
+        self.event = event
+        self.exception(
+            date(2026, 3, 15), EventException.CHANGE_CHANGED, new_title="Changed"
+        )
+
+        master, changed = self.components()
+        calendar = _build_ics_response([event]).content.decode()
+
+        self.assertIn("X-WR-TIMEZONE:America/Chicago", calendar)
+        self.assertIn("DTSTART;TZID=America/Chicago:20260301T090000", master)
+        self.assertIn("RRULE:FREQ=WEEKLY;COUNT=3", master)
+        self.assertIn("EXDATE;TZID=America/Chicago:20260308T090000", master)
+        self.assertIn("RECURRENCE-ID;TZID=America/Chicago:20260315T090000", changed)
+        self.assertIn("DTSTART;TZID=America/Chicago:20260315T090000", changed)

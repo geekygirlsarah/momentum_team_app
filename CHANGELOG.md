@@ -2,10 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-11-24
+
+### Changed
+- New applications now use the redesigned application process by default: student and guardian details are saved directly to an isolated draft profile as each step is completed, acceptance requires required forms and lead review of any new or ambiguous family matches, and a single reviewer approval finalizes the application without a separate "Convert" step.
+
+### Fixed
+- A student or adult record is no longer incorrectly treated as a duplicate email because of a same-email record in a completely different organization; email-match checks now only consider records within the same organization.
+- Deadline reminders for an unfinished application are now due starting three days before the program's application window closes, matching the originally requested timing, instead of two.
+- A profile-workflow application's direct edit to a student or guardian profile is no longer applied if the authorization it relied on (such as an existing guardian relationship) is revoked by another change in the moment between the authorization check and the write; the edit is now left for lead review instead.
+
+## 2026-11-23
+
+### Added
+- Lead Mentors can select an organization's IANA time zone in Portal Settings; the calendar page, subscriptions, and weekly digest keep timed recurring events at the same local time across daylight-saving changes.
+- Lead Mentors can edit typed student and guardian draft details on submitted profile-workflow applications; edits are conflict-checked, audited without recording sensitive values, and reset dependent identity and relationship decisions for review.
+- Student and guardian details entered during a profile-workflow application now save directly to an isolated draft profile as each step is completed, instead of being merged in later from JSON. A uniquely identified returning student's or guardian's authorized edits apply immediately to their existing profile; a new person, an ambiguous match, or another guardian's details wait for lead review before anything changes.
+- Deleting an application — whether an applicant withdraws it, a reviewer removes it, or it expires after 30 days unfinished — now also removes any new draft student or guardian profile it created for review, as long as that profile is still unused and not referenced by another application, so an abandoned application can no longer permanently occupy a family's email.
+- Missing-document reminders now also reach a guardian linked through a profile-workflow application's draft, not only one found in the legacy application data.
+- The safeguard that stops two profile-workflow applications from claiming the same family's email at once now also covers student/guardian records created or edited through staff forms, spreadsheet imports, alumni conversion, and record merges, not only the application itself.
+- Merging duplicate student or guardian records now carries over any profile-workflow application's draft link to the surviving record, so a merge no longer disconnects an in-progress or already-reviewed application from its profile.
+
 ## 2026-11-22
+
+### Added
+- Lead Mentors can edit typed fixed and active frozen-question answers for profile-workflow applications awaiting review, with stale-edit protection and audit events that omit answer values.
 
 ### Fixed
 - Platform and portal organization settings updates now preserve unrelated shared and structured settings, including email branding, sender identities, and payment instructions.
+
+### Changed
+- The travel event form defaults new events to competition, which can be turned off for non-competition trips; the option explains its badge and separate student attendance-response behavior.
+- Student, parent chaperone, and mentor roster tables show departure columns only when organized travel is enabled and at least one departure exists.
 
 ## 2026-11-21
 

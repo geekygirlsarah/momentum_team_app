@@ -1,6 +1,7 @@
 """Tests for ICS feed endpoints."""
 
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase
 from django.utils import timezone
@@ -179,7 +180,11 @@ class ICSEventFormatTests(TestCase):
         )
         resp = self.client.get(f"/calendar/{feed.slug}/feed.ics")
         body = resp.content.decode("utf-8")
-        self.assertIn(f"EXDATE:{deleted_date:%Y%m%d}T{start:%H%M%S}Z", body)
+        local_start = timezone.localtime(start, ZoneInfo("America/New_York"))
+        self.assertIn(
+            f"EXDATE;TZID=America/New_York:{deleted_date:%Y%m%d}T{local_start:%H%M%S}",
+            body,
+        )
 
     def test_localtime_conversion_and_tzid_formatting(self):
         feed = make_feed(
@@ -239,6 +244,13 @@ class ICSEventFormatTests(TestCase):
         )
         resp = self.client.get(f"/calendar/{feed.slug}/feed.ics")
         body = resp.content.decode("utf-8")
-        self.assertIn(f"RECURRENCE-ID:{target_date:%Y%m%d}T{start:%H%M%S}Z", body)
+        local_start = timezone.localtime(start, ZoneInfo("America/New_York"))
+        local_new_start = timezone.localtime(new_start, ZoneInfo("America/New_York"))
+        self.assertIn(
+            f"RECURRENCE-ID;TZID=America/New_York:{target_date:%Y%m%d}T{local_start:%H%M%S}",
+            body,
+        )
         self.assertIn("SUMMARY:Moved Study Session", body)
-        self.assertIn("DTSTART;TZID=America/New_York:", body)
+        self.assertIn(
+            f"DTSTART;TZID=America/New_York:{local_new_start:%Y%m%dT%H%M%S}", body
+        )

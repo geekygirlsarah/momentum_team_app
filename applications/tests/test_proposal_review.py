@@ -1,13 +1,19 @@
+import shutil
+import tempfile
+from datetime import date
 from unittest.mock import patch
 from uuid import uuid4
 
+from cryptography.fernet import Fernet
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
-from django.test import Client, TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from applications.forms import NOT_LISTED_SCHOOL
 from applications.models import (
     Application,
     ApplicationDocumentSubmission,
@@ -18,6 +24,7 @@ from applications.models import (
     ApplicationQuestionSet,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
     StudentApplicationAnswer,
 )
 from applications.proposals import ApplicationFinalizationError
@@ -30,10 +37,17 @@ from programs.models import (
     Enrollment,
     Program,
     ProgramDocument,
+    RaceEthnicity,
+    School,
     Student,
+    StudentDocument,
 )
 
+_MEDIA_ROOT = tempfile.mkdtemp(prefix="application-proposal-review-")
+_FILE_ENCRYPTION_KEY = Fernet.generate_key().decode()
 
+
+@override_settings(FILE_ENCRYPTION_KEY=_FILE_ENCRYPTION_KEY, MEDIA_ROOT=_MEDIA_ROOT)
 class ApplicationProposalReviewTests(TestCase):
     def setUp(self):
         self.organization = Organization.objects.create(
@@ -70,6 +84,11 @@ class ApplicationProposalReviewTests(TestCase):
         self.client.force_login(reviewer)
         self.application = self.make_application()
 
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(_MEDIA_ROOT, ignore_errors=True)
+
     def make_application(self, **overrides):
         defaults = {
             "organization": self.organization,
@@ -84,7 +103,7 @@ class ApplicationProposalReviewTests(TestCase):
         defaults.update(overrides)
         return Application.objects.create(**defaults)
 
-    def profile(self, model, email, first_name):
+    def profile(self, model, email, first_name, **overrides):
         values = {
             "organization": self.organization,
             "personal_email": email,
@@ -94,6 +113,7 @@ class ApplicationProposalReviewTests(TestCase):
         }
         if model is Adult:
             values["is_parent"] = True
+        values.update(overrides)
         return model.all_objects.create(**values)
 
     def add_identity_decision(
@@ -118,31 +138,56 @@ class ApplicationProposalReviewTests(TestCase):
         )
 
     def add_new_profile_workflow(
-        self, include_required_document=True, required_form=True, existing_student=False
+        self,
+        include_required_document=True,
+        required_form=True,
+        existing_student=False,
+        student_draft_values=None,
+        guardian_draft_values=None,
+        student_profile_values=None,
+        guardian_profile_values=None,
     ):
-        student = self.profile(Student, "student@example.test", "Student")
+        student = self.profile(
+            Student,
+            "student@example.test",
+            "Student",
+            **(student_profile_values or {}),
+        )
         if existing_student:
             student.is_incomplete_application_profile = False
             student.save(update_fields=["is_incomplete_application_profile"])
-        guardian = self.profile(Adult, "guardian@example.test", "Guardian")
+        guardian = self.profile(
+            Adult,
+            "guardian@example.test",
+            "Guardian",
+            **(guardian_profile_values or {}),
+        )
         self.application.student_profile = student
         self.application.primary_guardian_profile = guardian
         self.application.save(
             update_fields=["student_profile", "primary_guardian_profile", "updated_at"]
         )
+        student_draft_fields = {
+            "legal_first_name": "Student",
+            "last_name": "Applicant",
+        }
+        student_draft_fields.update(student_draft_values or {})
         student_draft = ApplicationStudentDraft.objects.create(
             organization=self.organization,
             application=self.application,
-            legal_first_name="Student",
-            last_name="Applicant",
+            **student_draft_fields,
         )
+        guardian_draft_fields = {
+            "email": "guardian@example.test",
+            "relationship_to_student": "parent",
+        }
+        guardian_draft_fields.update(guardian_draft_values or {})
         guardian_draft = ApplicationGuardianDraft.objects.create(
             organization=self.organization,
             application=self.application,
             slot=ApplicationGuardianDraft.Slot.PRIMARY,
             presence=ApplicationGuardianDraft.Presence.PRESENT,
-            email="guardian@example.test",
-            relationship_to_student="parent",
+            **guardian_draft_fields,
         )
         self.add_identity_decision(ApplicationIdentityProposal.SubjectSlot.STUDENT)
         self.add_identity_decision(
@@ -184,7 +229,7 @@ class ApplicationProposalReviewTests(TestCase):
                 organization=self.organization,
                 application=self.application,
                 document=document,
-                file="private/application_documents/signed.pdf",
+                file=SimpleUploadedFile("signed.pdf", b"signed form content"),
             )
         ApplicationFixedAnswer.objects.create(
             organization=self.organization,
@@ -578,8 +623,536 @@ class ApplicationProposalReviewTests(TestCase):
         self.assertTrue(student.is_incomplete_application_profile)
         self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
 
-    def test_final_approval_activates_profiles_and_relationships_atomically(self):
+    def test_approval_transfers_required_document_to_encrypted_student_document(self):
+        student, _ = self.add_new_profile_workflow()
+        document = ProgramDocument.objects.get(
+            program=self.program, name="Permission form"
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        submission = ApplicationDocumentSubmission.objects.get(
+            application=self.application, document=document
+        )
+        with submission.file.open("rb") as signed_file:
+            self.assertEqual(signed_file.read(), b"signed form content")
+        student_document = StudentDocument.objects.get(
+            student=student, program_document=document
+        )
+        with student_document.file.open("rb") as signed_file:
+            self.assertEqual(signed_file.read(), b"signed form content")
+        with student_document.file.storage.open(
+            student_document.file.name, "rb"
+        ) as raw_file:
+            self.assertNotEqual(raw_file.read(), b"signed form content")
+
+    def test_unreadable_document_transfer_rolls_back_profile_finalization(self):
         student, guardian = self.add_new_profile_workflow()
+        submission = ApplicationDocumentSubmission.objects.get(
+            application=self.application
+        )
+        ApplicationDocumentSubmission.objects.filter(pk=submission.pk).update(
+            file="missing-signed-document.pdf"
+        )
+        submission.refresh_from_db()
+
+        with (
+            patch.object(
+                submission.file.storage,
+                "open",
+                side_effect=FileNotFoundError("missing"),
+            ),
+            patch(
+                "applications.views.review.send_application_approved_email"
+            ) as notice,
+        ):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "signed document could not be copied")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(guardian.legal_first_name, "Guardian")
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
+        notice.assert_not_called()
+
+    def test_approval_rejects_duplicate_typed_student_and_guardian_emails(self):
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={
+                "legal_first_name": "Typed Student",
+                "personal_email": "guardian@example.test",
+            },
+            student_profile_values={
+                "personal_email": "placeholder-student@example.test",
+            },
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student and guardian emails must be distinct before acceptance."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(student.personal_email, "placeholder-student@example.test")
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+
+    def test_approval_rejects_foreign_race_ethnicity_on_student_draft(self):
+        student, guardian = self.add_new_profile_workflow()
+        draft = ApplicationStudentDraft.objects.get(application=self.application)
+        local_race = RaceEthnicity.objects.create(
+            organization=self.organization,
+            key="local-race",
+            name="Local race",
+        )
+        link = ApplicationStudentDraftRaceEthnicity.objects.create(
+            organization=self.organization,
+            student_draft=draft,
+            race_ethnicity=local_race,
+        )
+        foreign_organization = Organization.objects.create(
+            name="Foreign Race Organization",
+            slug="foreign-race-review",
+            subdomain="foreign-race-review",
+        )
+        foreign_race = RaceEthnicity.objects.create(
+            organization=foreign_organization,
+            key="foreign-race",
+            name="Foreign race",
+        )
+        ApplicationStudentDraftRaceEthnicity.objects.filter(pk=link.pk).update(
+            race_ethnicity=foreign_race
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student race and ethnicity selections are inconsistent."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+
+    def test_foreign_document_submission_blocks_profile_finalization(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Document Organization",
+            slug="foreign-document-review",
+            subdomain="foreign-document-review",
+        )
+        foreign_program = Program.objects.create(
+            organization=foreign_organization, name="Foreign Program"
+        )
+        foreign_document = ProgramDocument.objects.create(
+            program=foreign_program, name="Foreign release"
+        )
+        ApplicationDocumentSubmission.objects.create(
+            organization=foreign_organization,
+            application=self.application,
+            document=foreign_document,
+            file=SimpleUploadedFile("foreign.pdf", b"foreign signed form"),
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Application documents must belong")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
+
+    def test_mismatched_program_document_blocks_profile_finalization(self):
+        student, guardian = self.add_new_profile_workflow()
+        other_program = Program.objects.create(
+            organization=self.organization, name="Other Program"
+        )
+        other_document = ProgramDocument.objects.create(
+            program=other_program, name="Other program release"
+        )
+        ApplicationDocumentSubmission.objects.create(
+            organization=self.organization,
+            application=self.application,
+            document=other_document,
+            file=SimpleUploadedFile("other.pdf", b"other signed form"),
+        )
+
+        response = self.client.post(
+            reverse(
+                "application_review_approve", args=[self.application.application_id]
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Application documents must belong")
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(StudentDocument.objects.filter(student=student).exists())
+
+    def test_approval_waits_for_required_structured_answers(self):
+        student, guardian = self.add_new_profile_workflow()
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(answer=" ")
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Required custom application questions are unanswered."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_malformed_frozen_question_wording(self):
+        student, guardian = self.add_new_profile_workflow()
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(question_text=" ")
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Frozen application question answers are inconsistent."
+        )
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_fixed_answer(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Fixed Answer Organization",
+            slug="foreign-fixed-answer",
+            subdomain="foreign-fixed-answer",
+        )
+        fixed = ApplicationFixedAnswer.objects.get(application=self.application)
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_question_set(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Question Set Organization",
+            slug="foreign-question-set",
+            subdomain="foreign-question-set",
+        )
+        question_set = ApplicationQuestionSet.objects.get(application=self.application)
+        ApplicationQuestionSet.objects.filter(pk=question_set.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_rejects_cross_organization_question_answer(self):
+        student, guardian = self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Question Answer Organization",
+            slug="foreign-question-answer",
+            subdomain="foreign-question-answer",
+        )
+        answer = ApplicationQuestionAnswer.objects.get(
+            question_set__application=self.application
+        )
+        ApplicationQuestionAnswer.objects.filter(pk=answer.pk).update(
+            organization=foreign_organization
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_requires_active_question_snapshot(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionSet.objects.filter(application=self.application).delete()
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_approval_accepts_frozen_empty_question_set(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionAnswer.objects.filter(
+            question_set__application=self.application
+        ).delete()
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertFalse(student.is_incomplete_application_profile)
+        self.assertFalse(guardian.is_incomplete_application_profile)
+        self.assertFalse(
+            StudentApplicationAnswer.objects.filter(
+                application=self.application, source_step="step6-custom"
+            ).exists()
+        )
+
+    def test_approval_accepts_blank_optional_question(self):
+        student, guardian = self.add_new_profile_workflow()
+        ApplicationQuestionAnswer.objects.filter(
+            question_set__application=self.application
+        ).update(is_required=False, answer="")
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertFalse(student.is_incomplete_application_profile)
+        self.assertFalse(guardian.is_incomplete_application_profile)
+
+    def test_final_approval_activates_profiles_and_relationships_atomically(self):
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={
+                "legal_first_name": "Typed Student",
+                "preferred_first_name": "Sparky",
+                "date_of_birth": date(2010, 5, 4),
+                "address": "123 Robot Way",
+                "school_name": "Typed High School",
+                "state": "OH",
+                "zip_code": "15213",
+                "personal_email": "student@example.test",
+                "phone_number": "412-555-0111",
+                "phone_type": "cell",
+                "can_receive_texts": False,
+                "directory_consent": False,
+                "graduation_year": 2028,
+                "tshirt_size": "M",
+                "allergies": "Peanuts",
+                "allergies_answered": True,
+            },
+            guardian_draft_values={
+                "legal_first_name": "Typed Guardian",
+                "email": "guardian@example.test",
+                "address": "456 Guardian Way",
+                "state": "OH",
+                "zip_code": "15213",
+                "phone_number": "412-555-0222",
+                "phone_type": "cell",
+                "can_receive_texts": False,
+                "email_updates": False,
+            },
+            student_profile_values={
+                "personal_email": "placeholder-student@example.test",
+                "can_receive_texts": True,
+                "directory_consent": True,
+                "city": "Retained Student City",
+            },
+            guardian_profile_values={
+                "personal_email": "placeholder-guardian@example.test",
+                "can_receive_texts": True,
+                "email_updates": True,
+                "city": "Retained Guardian City",
+            },
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        race_ethnicity = RaceEthnicity.objects.create(
+            organization=self.organization,
+            key="asian",
+            name="Asian",
+        )
+        ApplicationStudentDraftRaceEthnicity.objects.create(
+            organization=self.organization,
+            student_draft=student_draft,
+            race_ethnicity=race_ethnicity,
+        )
 
         with patch("applications.views.review.send_application_approved_email"):
             response = self.client.post(
@@ -603,6 +1176,33 @@ class ApplicationProposalReviewTests(TestCase):
         )
         self.assertFalse(student.is_incomplete_application_profile)
         self.assertFalse(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.legal_first_name, "Typed Student")
+        self.assertEqual(student.preferred_first_name, "Sparky")
+        self.assertEqual(student.date_of_birth, date(2010, 5, 4))
+        self.assertEqual(student.address, "123 Robot Way")
+        self.assertEqual(student.state, "OH")
+        self.assertEqual(student.zip_code, "15213")
+        self.assertEqual(student.personal_email, "student@example.test")
+        self.assertEqual(student.phone_number, "412-555-0111")
+        self.assertFalse(student.can_receive_texts)
+        self.assertFalse(student.directory_consent)
+        self.assertEqual(student.graduation_year, 2028)
+        self.assertEqual(student.tshirt_size, "M")
+        self.assertEqual(student.allergies, "Peanuts")
+        self.assertEqual(student.city, "Retained Student City")
+        self.assertEqual(student.school.name, "Typed High School")
+        self.assertQuerySetEqual(
+            student.race_ethnicities.order_by("pk"), [race_ethnicity]
+        )
+        self.assertEqual(guardian.legal_first_name, "Typed Guardian")
+        self.assertEqual(guardian.personal_email, "guardian@example.test")
+        self.assertEqual(guardian.address, "456 Guardian Way")
+        self.assertEqual(guardian.state, "OH")
+        self.assertEqual(guardian.zip_code, "15213")
+        self.assertEqual(guardian.phone_number, "412-555-0222")
+        self.assertFalse(guardian.can_receive_texts)
+        self.assertFalse(guardian.email_updates)
+        self.assertEqual(guardian.city, "Retained Guardian City")
         self.assertTrue(
             AdultStudentRelationship.objects.filter(
                 student=student, adult=guardian
@@ -633,6 +1233,105 @@ class ApplicationProposalReviewTests(TestCase):
         )
         self.assertEqual(custom_answer.question_text, "What will you build?")
         self.assertEqual(custom_answer.answer, "A small rover.")
+
+    def test_existing_confirmed_student_is_not_overwritten_from_draft(self):
+        student, guardian = self.add_new_profile_workflow(
+            existing_student=True,
+            student_draft_values={
+                "legal_first_name": "Unapproved Student Name",
+                "personal_email": "changed-student@example.test",
+            },
+            student_profile_values={
+                "legal_first_name": "Established Student",
+                "personal_email": "student@example.test",
+            },
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        identity.candidate_student = student
+        identity.target_student = student
+        identity.match_state = ApplicationIdentityProposal.MatchState.UNIQUE
+        identity.candidate_baseline_revision = student.profile_revision
+        identity.target_baseline_revision = student.profile_revision
+        identity.decision = ApplicationIdentityProposal.Decision.CONFIRMED
+        identity.reviewed_by = self.reviewer
+        identity.reviewed_at = timezone.now()
+        identity.save()
+
+        with patch("applications.views.review.send_application_approved_email"):
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.APPROVED_SIGNED)
+        self.assertEqual(student.legal_first_name, "Established Student")
+        self.assertEqual(student.personal_email, "student@example.test")
+
+    def test_final_approval_rejects_conflicting_typed_email_claims(self):
+        student, guardian = self.add_new_profile_workflow(
+            student_draft_values={"personal_email": "guardian@example.test"},
+        )
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertEqual(student.personal_email, "student@example.test")
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        self.assertFalse(
+            AdultStudentRelationship.all_objects.filter(student=student).exists()
+        )
+        notice.assert_not_called()
+
+    def test_stale_typed_draft_prevents_final_approval(self):
+        student, guardian = self.add_new_profile_workflow(
+            include_required_document=False,
+        )
+        draft = ApplicationStudentDraft.objects.get(application=self.application)
+        draft.legal_first_name = "Changed after review"
+        draft.save(update_fields=["legal_first_name"])
+
+        with patch(
+            "applications.views.review.send_application_approved_email"
+        ) as notice:
+            response = self.client.post(
+                reverse(
+                    "application_review_approve", args=[self.application.application_id]
+                ),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.application.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(self.application.status, Application.Status.SUBMITTED)
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+        self.assertFalse(Enrollment.all_objects.filter(student=student).exists())
+        notice.assert_not_called()
 
     def test_late_finalization_conflict_rolls_back_all_profile_and_relationship_changes(
         self,
@@ -721,6 +1420,11 @@ class ApplicationProposalReviewTests(TestCase):
                 "secondary_guardian_profile",
                 "updated_at",
             ]
+        )
+        ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
         )
         ApplicationStudentDraft.objects.create(
             organization=self.organization,
@@ -839,3 +1543,704 @@ class ApplicationProposalReviewTests(TestCase):
             ).exists()
         )
         self.assertEqual(student.primary_contact, new_primary)
+
+    def test_typed_profile_draft_editor_is_available_for_review(self):
+        student, guardian = self.add_new_profile_workflow()
+        editor_url = (
+            f"/apply/review/{self.application.application_id}/edit-typed-profiles/"
+        )
+
+        response = self.client.get(editor_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Edit typed profile details")
+        self.assertContains(
+            response, "These edits change only the application-owned drafts"
+        )
+        self.assertContains(response, "Student draft")
+        self.assertContains(response, "Primary guardian")
+        self.assertTrue(student.is_incomplete_application_profile)
+        self.assertTrue(guardian.is_incomplete_application_profile)
+
+    def typed_profile_editor_url(self):
+        return f"/apply/review/{self.application.application_id}/edit-typed-profiles/"
+
+    def valid_typed_profile_post_data(self, response):
+        data = {
+            "state_version": response.context["state_version"],
+            "student-legal_first_name": "Updated Student",
+            "student-preferred_first_name": "",
+            "student-last_name": "Applicant",
+            "student-pronouns": "they/them",
+            "student-date_of_birth": "2012-01-01",
+            "student-confirm_age": "true",
+            "student-address": "123 Main Street",
+            "student-city": "Pittsburgh",
+            "student-state": "PA",
+            "student-zip_code": "15213",
+            "student-personal_email": "student-new@example.test",
+            "student-phone_number": "",
+            "student-phone_type": "cell",
+            "student-can_receive_texts": "false",
+            "student-directory_consent": "true",
+            "student-school_name": NOT_LISTED_SCHOOL,
+            "student-grade": "8",
+            "student-confirm_grade": "false",
+            "student-graduation_year": "2030",
+            "student-allergies": "Peanuts",
+            "student-allergies_answered": "true",
+            "student-dietary_restrictions": "",
+            "student-dietary_restrictions_answered": "false",
+            "student-medical_notes": "Sensitive medical detail",
+            "student-medical_notes_answered": "true",
+            "guardian_primary-legal_first_name": "Updated Guardian",
+            "guardian_primary-preferred_first_name": "",
+            "guardian_primary-last_name": "Applicant",
+            "guardian_primary-pronouns": "",
+            "guardian_primary-relationship_to_student": "parent",
+            "guardian_primary-specific_relationship": "mother",
+            "guardian_primary-email": "guardian@example.test",
+            "guardian_primary-address": "123 Main Street",
+            "guardian_primary-city": "Pittsburgh",
+            "guardian_primary-state": "PA",
+            "guardian_primary-zip_code": "15213",
+            "guardian_primary-phone_number": "4125550100",
+            "guardian_primary-phone_type": "cell",
+            "guardian_primary-can_receive_texts": "true",
+            "guardian_primary-email_updates": "false",
+        }
+        return data
+
+    def test_typed_profile_editor_updates_only_application_drafts_and_resets_reviews(
+        self,
+    ):
+        student, guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        guardian_draft = ApplicationGuardianDraft.objects.get(
+            application=self.application
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        relationships = list(
+            ApplicationRelationshipProposal.objects.filter(application=self.application)
+        )
+        for relationship in relationships:
+            relationship.decision = ApplicationRelationshipProposal.Decision.APPROVED
+            relationship.reviewed_by = self.reviewer
+            relationship.reviewed_at = timezone.now()
+            relationship.save(
+                update_fields=[
+                    "decision",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "updated_at",
+                ]
+            )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft.refresh_from_db()
+        guardian_draft.refresh_from_db()
+        identity.refresh_from_db()
+        for relationship in relationships:
+            relationship.refresh_from_db()
+        student.refresh_from_db()
+        guardian.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Updated Student")
+        self.assertEqual(student_draft.allergies, "Peanuts")
+        self.assertEqual(student_draft.medical_notes, "Sensitive medical detail")
+        self.assertFalse(student_draft.can_receive_texts)
+        self.assertEqual(guardian_draft.legal_first_name, "Updated Guardian")
+        self.assertEqual(guardian_draft.phone_number, "4125550100")
+        self.assertEqual(student.legal_first_name, "Student")
+        self.assertEqual(guardian.legal_first_name, "Guardian")
+        self.assertEqual(
+            identity.decision, ApplicationIdentityProposal.Decision.PENDING
+        )
+        for relationship in relationships:
+            self.assertEqual(
+                relationship.decision,
+                ApplicationRelationshipProposal.Decision.PENDING,
+            )
+            self.assertTrue(relationship.is_baseline_current())
+        audit = AuditLog.objects.filter(
+            organization=self.organization,
+            event=AuditEvent.CONTACT_INFO_UPDATED,
+            resource_type="Application",
+            resource_id=str(self.application.pk),
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertNotIn("Sensitive medical detail", repr(audit.before))
+        self.assertNotIn("Sensitive medical detail", repr(audit.after))
+
+    def test_typed_profile_editor_rejects_stale_draft_without_overwriting_it(self):
+        student, _guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        ApplicationStudentDraft.objects.filter(pk=student_draft.pk).update(
+            legal_first_name="Concurrent Edit"
+        )
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed after you opened this page")
+        student_draft.refresh_from_db()
+        student.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Concurrent Edit")
+        self.assertEqual(student.legal_first_name, "Student")
+
+    def test_typed_profile_editor_rejects_stale_review_decision(self):
+        self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        identity = ApplicationIdentityProposal.objects.get(
+            application=self.application,
+            subject_slot=ApplicationIdentityProposal.SubjectSlot.STUDENT,
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        ApplicationIdentityProposal.objects.filter(pk=identity.pk).update(
+            decision=ApplicationIdentityProposal.Decision.PENDING
+        )
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed after you opened this page")
+        student_draft.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Student")
+
+    def test_typed_profile_editor_allows_unchanged_historical_duplicate_emails(self):
+        self.add_new_profile_workflow(
+            student_draft_values={"personal_email": "guardian@example.test"}
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-personal_email"] = "guardian@example.test"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.personal_email, "guardian@example.test")
+
+    def test_typed_profile_editor_preserves_form_validation(self):
+        student, _guardian = self.add_new_profile_workflow()
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["guardian_primary-phone_number"] = "not a phone number"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Phone number must be exactly 10 digits.")
+        student_draft.refresh_from_db()
+        student.refresh_from_db()
+        self.assertEqual(student_draft.legal_first_name, "Student")
+        self.assertEqual(student.legal_first_name, "Student")
+
+    def test_typed_profile_editor_preserves_existing_graduation_year(self):
+        self.add_new_profile_workflow(student_draft_values={"graduation_year": 2024})
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-graduation_year"] = "2024"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.graduation_year, 2024)
+
+    def test_typed_profile_editor_rejects_new_duplicate_family_email(self):
+        self.add_new_profile_workflow()
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-personal_email"] = "guardian@example.test"
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Student and guardian contact emails must be different."
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertIsNone(student_draft.personal_email)
+
+    def test_typed_profile_editor_rejects_foreign_organization_race_option(self):
+        self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Race Option Organization",
+            slug="foreign-race-option",
+            subdomain="foreign-race-option",
+        )
+        foreign_race = RaceEthnicity.objects.create(
+            organization=foreign_organization,
+            key="foreign-race",
+            name="Foreign race option",
+        )
+        response = self.client.get(self.typed_profile_editor_url())
+        data = self.valid_typed_profile_post_data(response)
+        data["student-race_ethnicities"] = [str(foreign_race.pk)]
+
+        response = self.client.post(self.typed_profile_editor_url(), data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Select a valid choice")
+        self.assertFalse(
+            ApplicationStudentDraftRaceEthnicity.objects.filter(
+                race_ethnicity=foreign_race
+            ).exists()
+        )
+
+    def test_typed_profile_editor_rejects_missing_and_forged_versions(self):
+        self.add_new_profile_workflow()
+        for token in (None, "forged-version"):
+            response = self.client.get(self.typed_profile_editor_url())
+            data = self.valid_typed_profile_post_data(response)
+            if token is None:
+                data.pop("state_version")
+            else:
+                data["state_version"] = token
+
+            response = self.client.post(self.typed_profile_editor_url(), data)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertContains(response, "changed after you opened this page")
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        self.assertEqual(student_draft.legal_first_name, "Student")
+
+    def test_typed_profile_editor_reviewer_permission_and_tenant_are_required(self):
+        self.add_new_profile_workflow()
+        ordinary_user = get_user_model().objects.create_user(
+            username="typed-draft-ordinary-user",
+            email="typed-draft-ordinary@example.test",
+            password=None,
+        )
+        UserOrganizationMembership.objects.create(
+            user=ordinary_user,
+            organization=self.organization,
+            role="Student",
+            is_active=True,
+        )
+        self.client.force_login(ordinary_user)
+        response = self.client.get(self.typed_profile_editor_url())
+        self.assertEqual(response.status_code, 403)
+
+        foreign_organization = Organization.objects.create(
+            name="Foreign Typed Draft Organization",
+            slug="foreign-typed-draft-review",
+            subdomain="foreign-typed-draft-review",
+        )
+        self.client.force_login(self.reviewer)
+        response = self.client.get(
+            self.typed_profile_editor_url(),
+            HTTP_HOST=f"{foreign_organization.subdomain}.localhost",
+        )
+        self.assertIn(response.status_code, (403, 404))
+
+    def test_typed_profile_editor_fails_closed_for_foreign_draft_owner(self):
+        self.add_new_profile_workflow()
+        foreign_organization = Organization.objects.create(
+            name="Foreign Draft Owner",
+            slug="foreign-draft-owner",
+            subdomain="foreign-draft-owner",
+        )
+        student_draft = ApplicationStudentDraft.objects.get(
+            application=self.application
+        )
+        ApplicationStudentDraft.objects.filter(pk=student_draft.pk).update(
+            organization=foreign_organization
+        )
+
+        response = self.client.get(self.typed_profile_editor_url())
+
+        self.assertRedirects(
+            response,
+            reverse("apply_start"),
+            fetch_redirect_response=False,
+        )
+
+
+class StructuredAnswerReviewTests(TestCase):
+    def setUp(self):
+        self.organization = Organization.objects.create(
+            name="Structured Answer Organization",
+            slug="structured-answer-review",
+            subdomain="structured-answer-review",
+        )
+        self.program = Program.objects.create(
+            organization=self.organization,
+            name="Structured Answer Program",
+            active=True,
+        )
+        reviewer = get_user_model().objects.create_user(
+            username="structured-answer-reviewer",
+            email="reviewer@example.test",
+            password=None,
+        )
+        permission, _ = Permission.objects.get_or_create(
+            content_type=ContentType.objects.get_for_model(Application),
+            codename="review_application",
+            defaults={"name": "Can review applications"},
+        )
+        group, _ = Group.objects.get_or_create(name="LeadMentor")
+        group.permissions.add(permission)
+        reviewer.groups.add(group)
+        UserOrganizationMembership.objects.create(
+            user=reviewer,
+            organization=self.organization,
+            role="LeadMentor",
+            is_active=True,
+        )
+        self.reviewer = reviewer
+        self.client = Client(HTTP_HOST=f"{self.organization.subdomain}.localhost")
+        self.client.force_login(reviewer)
+        self.application = Application.objects.create(
+            organization=self.organization,
+            program=self.program,
+            applicant_type=Application.Type.STUDENT,
+            email="student@example.test",
+            email_verified_at=timezone.now(),
+            status=Application.Status.SUBMITTED,
+            submitted_at=timezone.now(),
+            profile_workflow_version=1,
+        )
+
+    def editor_url(self, application=None):
+        application = application or self.application
+        return reverse(
+            "application_review_edit_typed_answers",
+            args=[application.application_id],
+        )
+
+    @staticmethod
+    def state_version(response):
+        return response.context["form"]["state_version"].value()
+
+    def test_review_detail_links_to_typed_answer_editor(self):
+        response = self.client.get(
+            reverse("application_review_detail", args=[self.application.application_id])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.editor_url())
+        self.assertContains(response, "Edit typed answers")
+        self.assertNotContains(
+            response, "Editing structured application details is not available yet."
+        )
+
+    def test_editor_shows_frozen_active_questions_not_archived_questions(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Current fixed answer",
+        )
+        active_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        active_answer = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=active_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="What did the applicant see?",
+            is_required=True,
+            answer="Frozen answer",
+        )
+        archived_program = Program.objects.create(
+            organization=self.organization,
+            name="Previously selected program",
+        )
+        archived_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=archived_program,
+        )
+        archived_answer = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=archived_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Archived question wording?",
+            is_required=False,
+            answer="Archived answer",
+        )
+
+        response = self.client.get(self.editor_url())
+
+        self.assertEqual(response.status_code, 200)
+        form = response.context["form"]
+        self.assertEqual(
+            form.fields[f"fixed_answer_{fixed.pk}"].initial,
+            "Current fixed answer",
+        )
+        self.assertEqual(
+            form.fields[f"custom_answer_{active_answer.pk}"].label,
+            "What did the applicant see?",
+        )
+        self.assertNotIn(f"custom_answer_{archived_answer.pk}", form.fields)
+        self.assertContains(response, "What did the applicant see?")
+        self.assertNotContains(response, "Archived question wording?")
+
+    def test_editor_saves_answers_and_audits_without_answer_values(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Old fixed answer",
+        )
+        question_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        custom = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=question_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Required question?",
+            is_required=True,
+            answer="Old custom answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Updated fixed answer",
+                f"custom_answer_{custom.pk}": "Updated custom answer",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        fixed.refresh_from_db()
+        custom.refresh_from_db()
+        self.assertEqual(fixed.answer, "Updated fixed answer")
+        self.assertEqual(custom.answer, "Updated custom answer")
+        audit = AuditLog.objects.filter(
+            organization=self.organization,
+            event=AuditEvent.CONTACT_INFO_UPDATED,
+            resource_type="Application",
+            resource_id=str(self.application.pk),
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertNotIn("Updated fixed answer", repr(audit.before))
+        self.assertNotIn("Updated custom answer", repr(audit.after))
+
+    def test_missing_and_forged_state_versions_do_not_save(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+
+        for state_version in (None, "forged-version"):
+            data = {f"fixed_answer_{fixed.pk}": "Unsaved attempt"}
+            if state_version is not None:
+                data["state_version"] = state_version
+            response = self.client.post(self.editor_url(), data)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.context["form"].non_field_errors())
+            fixed.refresh_from_db()
+            self.assertEqual(fixed.answer, "Original answer")
+
+        self.assertTrue(token)
+
+    def test_stale_answer_version_preserves_current_data_and_submitted_value(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            answer="Competing answer"
+        )
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Stale submitted answer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context["form"][f"fixed_answer_{fixed.pk}"].value(),
+            "Stale submitted answer",
+        )
+        self.assertTrue(response.context["form"].non_field_errors())
+        fixed.refresh_from_db()
+        self.assertEqual(fixed.answer, "Competing answer")
+
+    def test_required_answers_cannot_be_cleared(self):
+        question_set = ApplicationQuestionSet.objects.create(
+            organization=self.organization,
+            application=self.application,
+            program=self.program,
+        )
+        custom = ApplicationQuestionAnswer.objects.create(
+            organization=self.organization,
+            question_set=question_set,
+            position=0,
+            question_id=uuid4(),
+            question_text="Required question?",
+            is_required=True,
+            answer="Required response",
+        )
+        response = self.client.get(self.editor_url())
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": self.state_version(response),
+                f"custom_answer_{custom.pk}": "   ",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["form"].errors)
+        custom.refresh_from_db()
+        self.assertEqual(custom.answer, "Required response")
+
+    def test_status_change_blocks_edits_after_editor_was_loaded(self):
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Original answer",
+        )
+        response = self.client.get(self.editor_url())
+        token = self.state_version(response)
+        Application.objects.filter(pk=self.application.pk).update(
+            status=Application.Status.APPROVED
+        )
+
+        response = self.client.post(
+            self.editor_url(),
+            {
+                "state_version": token,
+                f"fixed_answer_{fixed.pk}": "Post-approval edit",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse(
+                "application_review_detail", args=[self.application.application_id]
+            ),
+        )
+        fixed.refresh_from_db()
+        self.assertEqual(fixed.answer, "Original answer")
+
+    def test_malformed_cross_organization_answer_ownership_fails_closed(self):
+        foreign_organization = Organization.objects.create(
+            name="Foreign Organization",
+            slug="foreign-answer-owner",
+            subdomain="foreign-answer-owner",
+        )
+        fixed = ApplicationFixedAnswer.objects.create(
+            organization=self.organization,
+            application=self.application,
+            source_step="step6-experience",
+            question_key="interest_reason",
+            answer="Private answer",
+        )
+        ApplicationFixedAnswer.objects.filter(pk=fixed.pk).update(
+            organization=foreign_organization
+        )
+
+        response = self.client.get(self.editor_url())
+
+        self.assertRedirects(
+            response,
+            reverse("apply_start"),
+            fetch_redirect_response=False,
+        )
+
+    def test_reviewer_permission_and_application_tenant_are_required(self):
+        ordinary_user = get_user_model().objects.create_user(
+            username="ordinary-user",
+            email="ordinary@example.test",
+            password=None,
+        )
+        UserOrganizationMembership.objects.create(
+            user=ordinary_user,
+            organization=self.organization,
+            role="Student",
+            is_active=True,
+        )
+        self.client.force_login(ordinary_user)
+        response = self.client.get(self.editor_url())
+        self.assertEqual(response.status_code, 403)
+
+        foreign_organization = Organization.objects.create(
+            name="Foreign Organization",
+            slug="foreign-answer-review",
+            subdomain="foreign-answer-review",
+        )
+        response = self.client.get(
+            self.editor_url(),
+            HTTP_HOST=f"{foreign_organization.subdomain}.localhost",
+        )
+        self.assertIn(response.status_code, (403, 404))

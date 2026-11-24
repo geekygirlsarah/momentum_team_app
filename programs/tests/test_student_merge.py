@@ -43,6 +43,7 @@ from programs.models import (
     SubTeam,
     Team,
 )
+from programs.models.email_claims import ProfileEmailClaim
 
 
 @override_settings(FILE_ENCRYPTION_KEY="ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=")
@@ -173,6 +174,30 @@ class StudentMergeTest(TestCase):
         self.assertRedirects(response, reverse("student_list"))
         self.assertTrue(Student.objects.filter(pk=keep.pk).exists())
         self.assertFalse(Student.objects.filter(pk=source.pk).exists())
+
+    def test_merge_claims_both_emails_for_coordination(self):
+        """Merging must take the cross-writer email lock for both records'
+        emails, so a concurrent writer (e.g. the application wizard) can't
+        race it for the same organization/email."""
+        keep = self._student("Jane", "Doe", personal_email="jane@example.com")
+        source = self._student("Janet", "Doe", personal_email="janet@example.com")
+
+        response = self.client.post(
+            reverse("student_merge"),
+            {"keep": keep.pk, "source": source.pk},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=self.org, normalized_email="jane@example.com"
+            ).exists()
+        )
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=self.org, normalized_email="janet@example.com"
+            ).exists()
+        )
 
     def test_merge_creates_audit_log(self):
         keep = self._student("Jane", "Doe")
@@ -768,6 +793,29 @@ class StudentMergeTest(TestCase):
 
         app.refresh_from_db()
         self.assertEqual(app.converted_student, keep)
+
+    def test_merge_transfers_profile_workflow_student_link(self):
+        """A profile-workflow application's link to the isolated student
+        profile it activated must follow the merge, not silently go NULL."""
+        keep = self._student("Jane", "Doe")
+        source = self._student("Janet", "Doe")
+
+        app = Application.objects.create(
+            applicant_type=Application.Type.STUDENT,
+            program=self.program,
+            email="janet@example.com",
+            profile_workflow_version=1,
+            student_profile=source,
+        )
+
+        response = self.client.post(
+            reverse("student_merge"),
+            {"keep": keep.pk, "source": source.pk},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        app.refresh_from_db()
+        self.assertEqual(app.student_profile, keep)
 
     def test_merge_transfers_and_merges_outreach_signups(self):
         event = OutreachEvent.objects.create(

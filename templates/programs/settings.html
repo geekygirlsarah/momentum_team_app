@@ -1910,6 +1910,16 @@
                     <div class="alert alert-info mb-3" role="alert">
                         Your Momentum address keeps working after you connect a domain. New custom addresses need DNS, HTTPS, and host routing checked by a Momentum administrator; existing legacy addresses may already work during the transition.
                     </div>
+                    <form method="post" action="{% url 'portal_time_zone_settings' %}" class="border rounded-3 p-3 mb-4">
+                        {% csrf_token %}
+                        <label for="organization_time_zone" class="form-label fw-semibold">Organization time zone</label>
+                        <p class="small text-muted">Used for calendar dates and times in weekly digest emails.</p>
+                        <div class="input-group">
+                            {{ organization_time_zone_form.time_zone }}
+                            <button type="submit" class="btn btn-outline-primary">Save time zone</button>
+                        </div>
+                        <div class="form-text">Enter an IANA time-zone name, such as America/New_York or America/Chicago.</div>
+                    </form>
                     <form method="post" action="{% url 'portal_domains' %}" class="border rounded-3 p-3 mb-4">
                         {% csrf_token %}
                         <input type="hidden" name="action" value="request">

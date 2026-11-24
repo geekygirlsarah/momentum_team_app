@@ -1,8 +1,6 @@
 import logging
-from datetime import date, datetime, time, timedelta
-from datetime import timezone as datetime_timezone
+from datetime import date, timedelta
 
-from dateutil.rrule import rrulestr
 from django.conf import settings
 from django.http import HttpResponse
 from django.utils import timezone
@@ -11,7 +9,12 @@ from django.views import View
 from organizations.models import UserOrganizationMembership
 
 from .models import CalendarFeed, UserCalendarToken
-from .utils import normalize_rrule_until
+from .utils import (
+    event_occurrence_end,
+    event_occurrence_for_identity,
+    event_recurrence_rule,
+    get_event_timezone,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +29,13 @@ def _escape(text):
     )
 
 
-def _to_localtime(dt):
+def _to_localtime(dt, event_timezone=None):
     if dt is None:
         return None
+    event_timezone = event_timezone or timezone.get_current_timezone()
     if timezone.is_naive(dt):
-        dt = timezone.make_aware(dt, timezone.get_current_timezone())
-    return timezone.localtime(dt, timezone.get_current_timezone())
+        dt = timezone.make_aware(dt, event_timezone)
+    return timezone.localtime(dt, event_timezone)
 
 
 def _event_owned_exceptions(event):
@@ -40,10 +44,11 @@ def _event_owned_exceptions(event):
     return event.exceptions.filter(organization_id=event.organization_id)
 
 
-def _dt_lines(start, end):
-    tz_name = getattr(settings, "TIME_ZONE", "America/New_York")
-    local_start = _to_localtime(start)
-    local_end = _to_localtime(end)
+def _dt_lines(start, end, event_timezone=None):
+    event_timezone = event_timezone or timezone.get_current_timezone()
+    tz_name = getattr(event_timezone, "key", settings.TIME_ZONE)
+    local_start = _to_localtime(start, event_timezone)
+    local_end = _to_localtime(end, event_timezone)
     return [
         f"DTSTART;TZID={tz_name}:{local_start.strftime('%Y%m%dT%H%M%S')}",
         f"DTEND;TZID={tz_name}:{local_end.strftime('%Y%m%dT%H%M%S')}",
@@ -59,30 +64,21 @@ def _exdate_list(event, exceptions):
     return sorted(exdates)
 
 
-def _utc_datetime(dt):
-    return _to_localtime(dt).astimezone(datetime_timezone.utc)
-
-
 def _occurrence_start(event, day):
-    start = _utc_datetime(event.start_datetime)
-    return start.replace(year=day.year, month=day.month, day=day.day)
+    return event_occurrence_for_identity(event, day)
 
 
 def _current_exceptions(event, exceptions):
     if not event.rrule_ical or not exceptions:
         return []
     try:
-        rule = rrulestr(
-            normalize_rrule_until(event.rrule_ical),
-            dtstart=_utc_datetime(event.start_datetime),
-        )
+        rule, until = event_recurrence_rule(event)
         current = []
         for exc in exceptions:
-            start = datetime.combine(
-                exc.original_date, time.min, tzinfo=datetime_timezone.utc
+            occurrence = event_occurrence_for_identity(
+                event, exc.original_date, rule, until
             )
-            occurrence = rule.after(start, inc=True)
-            if occurrence is not None and occurrence.date() == exc.original_date:
+            if occurrence is not None:
                 current.append(exc)
         return current
     except (ValueError, TypeError, OverflowError):
@@ -94,13 +90,20 @@ def _current_exceptions(event, exceptions):
 
 def _exception_lines(event, exc):
     lines = ["BEGIN:VEVENT", f"UID:{event.uid}"]
-    local_start = _to_localtime(event.start_datetime)
-    local_end = _to_localtime(event.end_datetime)
+    event_timezone = get_event_timezone(event)
+    local_start = _to_localtime(
+        event.start_datetime,
+        None if event.all_day else event_timezone,
+    )
+    local_end = _to_localtime(
+        event.end_datetime, None if event.all_day else event_timezone
+    )
     if event.all_day:
         lines.append(f"RECURRENCE-ID;VALUE=DATE:{exc.original_date.strftime('%Y%m%d')}")
     else:
         occurrence = _occurrence_start(event, exc.original_date)
-        lines.append(f"RECURRENCE-ID:{occurrence:%Y%m%dT%H%M%SZ}")
+        tz_name = getattr(event_timezone, "key", settings.TIME_ZONE)
+        lines.append(f"RECURRENCE-ID;TZID={tz_name}:{occurrence:%Y%m%dT%H%M%S}")
     if exc.change_type == exc.CHANGE_MOVED:
         start, end = exc.new_start_datetime, exc.new_end_datetime
     elif event.all_day:
@@ -108,16 +111,14 @@ def _exception_lines(event, exc):
         start, end = local_start + delta, local_end + delta
     else:
         start = occurrence
-        end = start + (
-            _utc_datetime(event.end_datetime) - _utc_datetime(event.start_datetime)
-        )
+        end = event_occurrence_end(event, start)
     if event.all_day:
         start_date = _to_localtime(start).date()
         end_date = _to_localtime(end).date() + timedelta(days=1)
         lines.append(f"DTSTART;VALUE=DATE:{start_date:%Y%m%d}")
         lines.append(f"DTEND;VALUE=DATE:{end_date:%Y%m%d}")
     else:
-        lines.extend(_dt_lines(start, end))
+        lines.extend(_dt_lines(start, end, event_timezone))
     lines.append(f"SUMMARY:{_escape(exc.new_title or event.title)}")
     if exc.new_description or event.description:
         lines.append(f"DESCRIPTION:{_escape(exc.new_description or event.description)}")
@@ -129,6 +130,7 @@ def _exception_lines(event, exc):
 
 def _vevent_lines(event, exdates):
     lines = ["BEGIN:VEVENT", f"UID:{event.uid}"]
+    event_timezone = get_event_timezone(event)
 
     if event.all_day:
         local_start = _to_localtime(event.start_datetime)
@@ -138,11 +140,13 @@ def _vevent_lines(event, exdates):
         lines.append(f"DTSTART;VALUE=DATE:{dtstart}")
         lines.append(f"DTEND;VALUE=DATE:{dtend}")
     elif event.rrule_ical:
-        start = _utc_datetime(event.start_datetime)
-        end = _utc_datetime(event.end_datetime)
-        lines.extend([f"DTSTART:{start:%Y%m%dT%H%M%SZ}", f"DTEND:{end:%Y%m%dT%H%M%SZ}"])
+        lines.extend(
+            _dt_lines(event.start_datetime, event.end_datetime, event_timezone)
+        )
     else:
-        lines.extend(_dt_lines(event.start_datetime, event.end_datetime))
+        lines.extend(
+            _dt_lines(event.start_datetime, event.end_datetime, event_timezone)
+        )
 
     lines.append(f"SUMMARY:{_escape(event.title)}")
     if event.description:
@@ -159,9 +163,10 @@ def _vevent_lines(event, exdates):
             )
         else:
             values = ",".join(
-                f"{_occurrence_start(event, day):%Y%m%dT%H%M%SZ}" for day in exdates
+                f"{_occurrence_start(event, day):%Y%m%dT%H%M%S}" for day in exdates
             )
-            lines.append(f"EXDATE:{values}")
+            tz_name = getattr(event_timezone, "key", settings.TIME_ZONE)
+            lines.append(f"EXDATE;TZID={tz_name}:{values}")
 
     lines.append("END:VEVENT")
     return lines
@@ -169,7 +174,11 @@ def _vevent_lines(event, exdates):
 
 def _build_ics_response(events, feed_name="Momentum Calendar"):
     """Build an ICS HTTP response from a list of CalendarEvent objects."""
-    tz_name = getattr(settings, "TIME_ZONE", "America/New_York")
+    tz_name = (
+        getattr(get_event_timezone(events[0]), "key", settings.TIME_ZONE)
+        if events
+        else getattr(settings, "TIME_ZONE", "America/New_York")
+    )
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",

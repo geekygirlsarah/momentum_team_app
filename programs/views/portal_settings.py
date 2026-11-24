@@ -25,12 +25,18 @@ from organizations.utils import (
     get_organization_email_settings,
     get_organization_momentum_url,
     get_organization_payment_settings,
+    get_organization_timezone_name,
     update_organization_email_settings,
     update_organization_payment_settings,
     update_organization_sender_account,
+    update_organization_settings,
 )
 from programs.constants import TEAM_TYPES
-from programs.forms import MentorAgreementForm, PaymentInstructionsForm
+from programs.forms import (
+    MentorAgreementForm,
+    OrganizationTimeZoneForm,
+    PaymentInstructionsForm,
+)
 from programs.models import (
     BackgroundCheckType,
     Crew,
@@ -309,6 +315,10 @@ class PortalSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View):
             "eligible_lead_mentor_users": eligible_lead_mentor_users,
             "pending_lead_mentor_invitations": pending_lead_mentor_invitations,
             "organization": org,
+            "organization_time_zone": get_organization_timezone_name(org),
+            "organization_time_zone_form": OrganizationTimeZoneForm(
+                initial={"time_zone": get_organization_timezone_name(org)}
+            ),
             "organization_domains": organization_domains,
             "momentum_portal_url": get_organization_momentum_url(org),
             "email_settings": email_settings,
@@ -319,6 +329,24 @@ class PortalSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View):
             "sections": sections,
         }
         return render(request, self.template_name, context)
+
+
+class PortalTimeZoneSettingsView(LoginRequiredMixin, LeadMentorRequiredMixin, View):
+    """Update the resolved organization's display time zone."""
+
+    def post(self, request):
+        organization = _request_organization(request)
+        form = OrganizationTimeZoneForm(request.POST)
+        if not form.is_valid():
+            error = form.errors.get("time_zone", ["Enter a valid IANA time zone."])[0]
+            messages.error(request, error)
+            return redirect("/programs/settings/?tab=portal_address")
+
+        update_organization_settings(
+            organization, {"time_zone": form.cleaned_data["time_zone"]}
+        )
+        messages.success(request, "Organization time zone updated successfully.")
+        return redirect("/programs/settings/?tab=portal_address")
 
 
 class PortalPaymentInstructionsView(LoginRequiredMixin, LeadMentorRequiredMixin, View):

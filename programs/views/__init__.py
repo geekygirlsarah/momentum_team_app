@@ -76,6 +76,7 @@ from .portal_settings import (
     PortalSlidingScaleSettingsView,
     PortalSubteamView,
     PortalTeamView,
+    PortalTimeZoneSettingsView,
     ProgramGroupsView,
 )
 from .programs import (
@@ -168,6 +169,7 @@ __all__ = [
     "PortalSlidingScaleSettingsView",
     "PortalSubteamView",
     "PortalTeamView",
+    "PortalTimeZoneSettingsView",
     "ProgramAssignmentView",
     "ProgramCreateView",
     "ProgramDetailView",

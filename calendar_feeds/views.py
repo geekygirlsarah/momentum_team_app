@@ -1,4 +1,4 @@
-from datetime import date, datetime, time
+from datetime import date
 
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -12,6 +12,7 @@ from django.views import View
 from django.views.generic import ListView
 
 from audit.service import log_deletion
+from organizations.utils import get_organization_timezone
 from programs.permission_views import LeadMentorRequiredMixin, user_is_lead_mentor
 
 from .forms import (
@@ -23,7 +24,7 @@ from .forms import (
 from .ics import FeedICSView, PersonalICSFeedView, PublicICSFeedView  # noqa: F401
 from .models import CalendarEvent, CalendarFeed, EventException, UserCalendarToken
 from .occurrence_forms import OccurrenceForm
-from .utils import normalize_rrule_until
+from .utils import event_occurrence_end, event_occurrence_for_identity
 
 
 def _tenant_calendar_events(organization):
@@ -182,14 +183,19 @@ class CalendarEventsAPIView(View):
 
 class OrganizationRequiredMixin:
     def dispatch(self, request, *args, **kwargs):
-        if getattr(request, "organization", None) is None:
+        organization = getattr(request, "organization", None)
+        if organization is None:
             raise Http404
-        return super().dispatch(request, *args, **kwargs)
+        with timezone.override(get_organization_timezone(organization)):
+            return super().dispatch(request, *args, **kwargs)
 
 
 def _occurrence(request, pk, original_date):
     event = get_object_or_404(
-        _tenant_calendar_events(request.organization).select_related("feed"), pk=pk
+        _tenant_calendar_events(request.organization).select_related(
+            "feed", "organization__organization_settings"
+        ),
+        pk=pk,
     )
     if not event.feed.user_can_write(request.user):
         return event, None, None
@@ -201,14 +207,8 @@ def _occurrence(request, pk, original_date):
             or day in event.exdate_list
         ):
             raise ValueError
-        from dateutil.rrule import rrulestr
-
-        rule = rrulestr(
-            normalize_rrule_until(event.rrule_ical), dtstart=event.start_datetime
-        )
-        start = timezone.make_aware(datetime.combine(day, time.min), timezone.UTC)
-        occurrence = rule.after(start, inc=True)
-        if occurrence is None or occurrence.date() != day:
+        occurrence = event_occurrence_for_identity(event, day)
+        if occurrence is None:
             raise ValueError
     except (ValueError, TypeError, OverflowError):
         raise Http404
@@ -227,6 +227,7 @@ class OccurrenceEditView(OrganizationRequiredMixin, LoginRequiredMixin, View):
         if occurrence is None:
             messages.error(request, "You do not have permission to modify this event.")
             return redirect("calendar_feeds:calendar_view")
+        day = date.fromisoformat(original_date)
         start = (
             exception.new_start_datetime
             if exception and exception.new_start_datetime
@@ -235,7 +236,7 @@ class OccurrenceEditView(OrganizationRequiredMixin, LoginRequiredMixin, View):
         end = (
             exception.new_end_datetime
             if exception and exception.new_end_datetime
-            else occurrence + (event.end_datetime - event.start_datetime)
+            else event_occurrence_end(event, occurrence)
         )
         initial = {
             "title": exception.new_title or event.title if exception else event.title,
@@ -266,7 +267,7 @@ class OccurrenceEditView(OrganizationRequiredMixin, LoginRequiredMixin, View):
                         .get(pk=event.pk)
                     )
                     existing = EventException.objects.filter(
-                        event=locked, original_date=occurrence.date()
+                        event=locked, original_date=day
                     ).first()
                     if existing and (
                         existing.organization_id != locked.organization_id
@@ -276,14 +277,12 @@ class OccurrenceEditView(OrganizationRequiredMixin, LoginRequiredMixin, View):
                     obj = existing or EventException(
                         event=locked,
                         organization=locked.organization,
-                        original_date=occurrence.date(),
+                        original_date=day,
                         created_by=request.user,
                     )
                     new_start = form.cleaned_data["start_datetime"]
                     new_end = form.cleaned_data["end_datetime"]
-                    original_end = occurrence + (
-                        locked.end_datetime - locked.start_datetime
-                    )
+                    original_end = event_occurrence_end(locked, occurrence)
                     moved = new_start != occurrence or new_end != original_end
                     obj.change_type = (
                         EventException.CHANGE_MOVED

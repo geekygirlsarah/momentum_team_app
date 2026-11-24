@@ -4,6 +4,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from attendance.models import AttendanceEvent, AttendanceSession
+from organizations.models import Organization
 from programs.models import (
     Adult,
     AdultStudentRelationship,
@@ -12,6 +13,7 @@ from programs.models import (
     School,
     Student,
 )
+from programs.models.email_claims import ProfileEmailClaim
 
 
 class ImportSyncTests(TestCase):
@@ -131,6 +133,91 @@ class ImportSyncTests(TestCase):
             program=program, event_type=AttendanceEvent.IN
         ).get()
         self.assertEqual(event.visitor_team_number, 3504)
+
+
+class ImportEmailCoordinationTests(TestCase):
+    """Each import writer must claim the cross-writer email lock before
+    creating/updating a Student or Adult, so a concurrent writer (e.g. the
+    application wizard) can't race it for the same organization/email."""
+
+    def setUp(self):
+        self.password = "password123"  # nosec B105
+        self.user = User.objects.create_superuser(
+            username="admin",
+            email="admin@example.com",
+            password=self.password,
+        )
+        self.client.login(username="admin", password=self.password)
+        self.org = Organization.objects.get(slug="gos")
+
+    def _upload_csv(self, url_name, csv_text, extra_data=None, filename="import.csv"):
+        payload = {
+            "file": SimpleUploadedFile(
+                filename, csv_text.encode("utf-8"), content_type="text/csv"
+            )
+        }
+        if extra_data:
+            payload.update(extra_data)
+        return self.client.post(reverse(url_name), payload, follow=True)
+
+    def _claimed(self, email):
+        return ProfileEmailClaim.objects.filter(
+            organization=self.org, normalized_email=email.lower()
+        ).exists()
+
+    def test_student_import_claims_student_and_parent_emails(self):
+        csv_text = "\n".join(
+            [
+                "First Name,Last Name,Date of Birth,Email,Primary Parent First Name,"
+                "Primary Parent Last Name,Primary Parent Email",
+                "Ada,Lovelace,2005-12-10,ada@example.com,Anne,Byron,"
+                "anne.byron@example.com",
+            ]
+        )
+        response = self._upload_csv("student_import", csv_text)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._claimed("ada@example.com"))
+        self.assertTrue(self._claimed("anne.byron@example.com"))
+
+    def test_parent_import_claims_email(self):
+        csv_text = "\n".join(
+            [
+                "First Name,Last Name,Email",
+                "Marie,Curie,marie.curie@example.com",
+            ]
+        )
+        response = self._upload_csv("parent_import", csv_text)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._claimed("marie.curie@example.com"))
+
+    def test_relationship_import_claims_new_parent_email(self):
+        Student.objects.create(
+            legal_first_name="Katherine",
+            last_name="Johnson",
+            date_of_birth="2008-08-26",
+        )
+        csv_text = "\n".join(
+            [
+                "Legal First Name,Last Name,Date of Birth,Primary Parent First Name,"
+                "Primary Parent Last Name,Primary Parent Email",
+                "Katherine,Johnson,2008-08-26,Mary,Johnson,mary.johnson@example.com",
+            ]
+        )
+        response = self._upload_csv("relationship_import", csv_text)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._claimed("mary.johnson@example.com"))
+
+    def test_mentor_import_claims_personal_and_org_email(self):
+        csv_text = "\n".join(
+            [
+                "First Name,Last Name,Personal Email,Andrew Email,Role",
+                "Grace,Hopper,grace.hopper@example.com,ghopper@andrew.cmu.edu,mentor",
+            ]
+        )
+        response = self._upload_csv("mentor_import", csv_text)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._claimed("grace.hopper@example.com"))
+        self.assertTrue(self._claimed("ghopper@andrew.cmu.edu"))
 
 
 class ImportSampleCsvIntegrationTests(TestCase):

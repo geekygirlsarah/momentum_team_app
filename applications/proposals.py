@@ -11,18 +11,28 @@ from programs.models import (
     Adult,
     AdultStudentRelationship,
     Enrollment,
+    RaceEthnicity,
+    School,
     Student,
 )
 
-from .answers import save_structured_experience_answers
+from .answers import (
+    save_structured_experience_answers,
+    validate_structured_application_answers,
+)
 from .models import (
     Application,
     ApplicationGuardianDraft,
     ApplicationIdentityProposal,
     ApplicationRelationshipProposal,
     ApplicationStudentDraft,
+    ApplicationStudentDraftRaceEthnicity,
 )
-from .services import find_application_person_candidates
+from .services import (
+    ApplicationDocumentTransferError,
+    find_application_person_candidates,
+    transfer_application_documents_to_student,
+)
 
 
 @dataclass
@@ -104,22 +114,16 @@ def lock_application_proposal_context(application, using=None):
     }
     student_drafts = {
         draft.pk: draft
-        for draft in ApplicationStudentDraft.objects.using(using)
+        for draft in ApplicationStudentDraft._base_manager.using(using)
         .select_for_update()
-        .filter(
-            organization_id=organization_id,
-            application_id=application.pk,
-        )
+        .filter(application_id=application.pk)
         .order_by("pk")
     }
     guardian_drafts = {
         draft.pk: draft
-        for draft in ApplicationGuardianDraft.objects.using(using)
+        for draft in ApplicationGuardianDraft._base_manager.using(using)
         .select_for_update()
-        .filter(
-            organization_id=organization_id,
-            application_id=application.pk,
-        )
+        .filter(application_id=application.pk)
         .order_by("pk")
     }
     relationship_query = AdultStudentRelationship.all_objects.using(using).filter(
@@ -401,16 +405,23 @@ def _validate_relationship_plan(
     return primary_id, secondary_id, ""
 
 
-def validate_application_profile_email_claims(application, profiles):
+def validate_application_profile_email_claims(
+    application, profiles, proposed_profile_values=None
+):
     """Reject new same-organization email claims without rewriting history."""
     profiles = [profile for profile in profiles if profile is not None]
+    proposed_profile_values = proposed_profile_values or {}
     student_ids = [profile.pk for profile in profiles if isinstance(profile, Student)]
     adult_ids = [profile.pk for profile in profiles if isinstance(profile, Adult)]
     address_owners = {}
     for profile in profiles:
+        proposed = proposed_profile_values.get((type(profile), profile.pk), {})
         addresses = {
             (value or "").strip().casefold()
-            for value in (profile.personal_email, profile.org_email)
+            for value in (
+                proposed.get("personal_email", profile.personal_email),
+                proposed.get("org_email", profile.org_email),
+            )
         }
         for address in addresses - {""}:
             address_owners.setdefault(address, []).append(profile)
@@ -424,7 +435,11 @@ def validate_application_profile_email_claims(application, profiles):
     for profile in profiles:
         if not profile.is_incomplete_application_profile:
             continue
-        for value in (profile.personal_email, profile.org_email):
+        proposed = proposed_profile_values.get((type(profile), profile.pk), {})
+        for value in (
+            proposed.get("personal_email", profile.personal_email),
+            proposed.get("org_email", profile.org_email),
+        ):
             address = (value or "").strip()
             if not address:
                 continue
@@ -454,6 +469,159 @@ def validate_application_profile_email_claims(application, profiles):
             if student_match.exists() or adult_match.exists():
                 return "A profile email matches another person in this organization; resolve the identity first."
     return ""
+
+
+def draft_profile_fields(draft, field_map):
+    return {
+        profile_field: value
+        for draft_field, profile_field in field_map.items()
+        if (value := getattr(draft, draft_field)) is not None
+    }
+
+
+#: ApplicationStudentDraft field name -> Student field name. Shared with
+#: ``applications.identity_sync``, which applies the same mapping for an
+#: immediate, pre-review edit to an authorized existing (non-incomplete)
+#: profile; finalization below only ever touches a profile that is still
+#: incomplete, so the two call sites never fight over the same write.
+STUDENT_DRAFT_PROFILE_FIELD_MAP = {
+    "legal_first_name": "legal_first_name",
+    "preferred_first_name": "preferred_first_name",
+    "last_name": "last_name",
+    "pronouns": "pronouns",
+    "date_of_birth": "date_of_birth",
+    "address": "address",
+    "city": "city",
+    "state": "state",
+    "zip_code": "zip_code",
+    "personal_email": "personal_email",
+    "phone_number": "phone_number",
+    "phone_type": "phone_type",
+    "can_receive_texts": "can_receive_texts",
+    "directory_consent": "directory_consent",
+    "graduation_year": "graduation_year",
+    "tshirt_size": "tshirt_size",
+    "allergies": "allergies",
+    "dietary_restrictions": "dietary_restrictions",
+    "medical_notes": "medical_notes",
+}
+
+#: ApplicationGuardianDraft field name -> Adult field name. See
+#: ``STUDENT_DRAFT_PROFILE_FIELD_MAP`` above.
+GUARDIAN_DRAFT_PROFILE_FIELD_MAP = {
+    "legal_first_name": "legal_first_name",
+    "preferred_first_name": "preferred_first_name",
+    "last_name": "last_name",
+    "pronouns": "pronouns",
+    "email": "personal_email",
+    "address": "address",
+    "city": "city",
+    "state": "state",
+    "zip_code": "zip_code",
+    "phone_number": "phone_number",
+    "phone_type": "phone_type",
+    "can_receive_texts": "can_receive_texts",
+    "email_updates": "email_updates",
+}
+
+
+def student_draft_race_ethnicity_ids(application, draft, using):
+    links = list(
+        ApplicationStudentDraftRaceEthnicity._base_manager.using(using)
+        .filter(student_draft_id=draft.pk)
+        .select_for_update()
+        .order_by("pk")
+    )
+    if any(
+        link.organization_id != application.organization_id
+        or link.student_draft_id != draft.pk
+        for link in links
+    ):
+        raise ApplicationFinalizationError(
+            "Student race and ethnicity selections are inconsistent."
+        )
+    race_ids = {link.race_ethnicity_id for link in links}
+    races = list(
+        RaceEthnicity._base_manager.using(using)
+        .filter(pk__in=race_ids)
+        .select_for_update()
+        .order_by("pk")
+    )
+    if len(races) != len(race_ids) or any(
+        race.organization_id != application.organization_id for race in races
+    ):
+        raise ApplicationFinalizationError(
+            "Student race and ethnicity selections are inconsistent."
+        )
+    return tuple(race.pk for race in races)
+
+
+def _prepare_incomplete_profile_updates(
+    application, context, student, primary_guardian, secondary_guardian, using
+):
+    prepared = {}
+
+    if student.is_incomplete_application_profile:
+        student_drafts = list(context.student_drafts.values())
+        if len(student_drafts) != 1:
+            raise ApplicationFinalizationError(
+                "The incomplete student profile has no unique typed application draft."
+            )
+        draft = student_drafts[0]
+        if (
+            draft.application_id != application.pk
+            or draft.organization_id != application.organization_id
+        ):
+            raise ApplicationFinalizationError(
+                "The student application draft belongs to another organization."
+            )
+        fields = draft_profile_fields(draft, STUDENT_DRAFT_PROFILE_FIELD_MAP)
+        race_ids = student_draft_race_ethnicity_ids(application, draft, using)
+        if race_ids:
+            fields["race_ethnicities"] = race_ids
+        if draft.school_not_listed is True:
+            fields["school"] = None
+        elif draft.school_name is not None and draft.school_name.strip():
+            fields["school_name"] = draft.school_name.strip()
+        prepared[(Student, student.pk)] = fields
+
+    for slot, guardian in (
+        (ApplicationGuardianDraft.Slot.PRIMARY, primary_guardian),
+        (ApplicationGuardianDraft.Slot.SECONDARY, secondary_guardian),
+    ):
+        if guardian is None or not guardian.is_incomplete_application_profile:
+            continue
+        matching_drafts = [
+            draft for draft in context.guardian_drafts.values() if draft.slot == slot
+        ]
+        if len(matching_drafts) != 1:
+            raise ApplicationFinalizationError(
+                f"The incomplete {slot} guardian profile has no unique typed application draft."
+            )
+        draft = matching_drafts[0]
+        if (
+            draft.application_id != application.pk
+            or draft.organization_id != application.organization_id
+            or draft.presence != ApplicationGuardianDraft.Presence.PRESENT
+        ):
+            raise ApplicationFinalizationError(
+                f"The {slot} guardian application draft is inconsistent."
+            )
+        prepared[(Adult, guardian.pk)] = draft_profile_fields(
+            draft, GUARDIAN_DRAFT_PROFILE_FIELD_MAP
+        )
+    return prepared
+
+
+def _profile_email_values(prepared):
+    return {
+        profile_key: {
+            field: value
+            for field, value in values.items()
+            if field in ("personal_email", "org_email")
+        }
+        for profile_key, values in prepared.items()
+    }
 
 
 def _apply_relationship_proposals(application, context, request) -> None:
@@ -567,6 +735,7 @@ def _apply_relationship_proposals(application, context, request) -> None:
 
 def finalize_profile_workflow_application(application, request, using=None):
     """Revalidate and atomically activate a typed student/guardian workflow."""
+    using = using or application._state.db or "default"
     if application.profile_workflow_version == 0:
         return True, None, ""
     if application.profile_workflow_version != 1:
@@ -588,6 +757,11 @@ def finalize_profile_workflow_application(application, request, using=None):
         )
     if not application.program_id:
         return False, None, "A program is required before accepting this application."
+
+    try:
+        validate_structured_application_answers(application, using=using)
+    except ValueError as exc:
+        return False, None, str(exc)
 
     context = lock_application_proposal_context(application, using=using)
     resolved, reason = proposal_review_state(application)
@@ -687,9 +861,21 @@ def finalize_profile_workflow_application(application, request, using=None):
         if profile is not None
     ):
         return False, None, "Application profiles must belong to this organization."
+    try:
+        prepared_profile_updates = _prepare_incomplete_profile_updates(
+            application,
+            context,
+            student,
+            primary_guardian,
+            secondary_guardian,
+            using,
+        )
+    except ApplicationFinalizationError as exc:
+        return False, None, str(exc)
     email_error = validate_application_profile_email_claims(
         application,
         [student, primary_guardian, secondary_guardian],
+        proposed_profile_values=_profile_email_values(prepared_profile_updates),
     )
     if email_error:
         return False, None, email_error
@@ -739,7 +925,7 @@ def finalize_profile_workflow_application(application, request, using=None):
                 "An incomplete guardian profile already has relationships.",
             )
 
-    database = using or application._state.db or "default"
+    database = using
     existing_enrollment = (
         Enrollment.all_objects.using(database)
         .select_for_update()
@@ -763,7 +949,23 @@ def finalize_profile_workflow_application(application, request, using=None):
     for profile in (student, primary_guardian, secondary_guardian):
         if profile is None:
             continue
+        prepared = prepared_profile_updates.get((type(profile), profile.pk), {})
         fields = []
+        race_ethnicity_ids = prepared.pop("race_ethnicities", ())
+        school_name = prepared.pop("school_name", None)
+        for field, value in prepared.items():
+            if field == "school":
+                profile.school = value
+            else:
+                setattr(profile, field, value)
+            fields.append(field)
+        if school_name is not None:
+            school, _ = School._base_manager.using(database).get_or_create(
+                organization_id=application.organization_id,
+                name=school_name,
+            )
+            profile.school = school
+            fields.append("school")
         if profile.is_incomplete_application_profile:
             profile.is_incomplete_application_profile = False
             fields.append("is_incomplete_application_profile")
@@ -772,6 +974,8 @@ def finalize_profile_workflow_application(application, request, using=None):
             fields.append("is_parent")
         if fields:
             profile.save(update_fields=[*fields, "updated_at"])
+        if race_ethnicity_ids:
+            profile.race_ethnicities.set(race_ethnicity_ids)
 
     _apply_relationship_proposals(application, context, request)
 
@@ -820,5 +1024,9 @@ def finalize_profile_workflow_application(application, request, using=None):
     try:
         save_structured_experience_answers(application, student)
     except ValueError as exc:
+        raise ApplicationFinalizationError(str(exc)) from exc
+    try:
+        transfer_application_documents_to_student(application, student, using=using)
+    except ApplicationDocumentTransferError as exc:
         raise ApplicationFinalizationError(str(exc)) from exc
     return True, student, ""

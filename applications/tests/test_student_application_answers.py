@@ -318,6 +318,28 @@ class StudentApplicationAnswerTests(TestCase):
         self.assertNotIn(other_app.application_id, output.getvalue())
         self.assertIn("Applications requiring review: 3", output.getvalue())
 
+    def test_report_skips_profile_workflow_applications_instead_of_misreporting(self):
+        """A profile-workflow (version 1) application is finalized onto
+        ``student_profile`` and never sets ``converted_student``, so this
+        legacy-JSON report must skip it rather than always flag it as
+        having "no linked student"."""
+        self.application(
+            applicant_type=Application.Type.STUDENT,
+            status=Application.Status.APPROVED_SIGNED,
+            profile_workflow_version=1,
+            converted_student=None,
+            student_profile=self.student,
+            data={},
+        )
+        output = StringIO()
+        call_command(
+            "report_application_answer_backfill",
+            organization=self.org.slug,
+            stdout=output,
+        )
+        self.assertIn("Applications requiring review: 0", output.getvalue())
+        self.assertIn("Skipped 1 profile-workflow", output.getvalue())
+
     def test_report_can_identify_linked_answers_missing_from_backfill(self):
         missing = self.application()
         copied = self.application(data={"step6": {"referral_source": "School"}})

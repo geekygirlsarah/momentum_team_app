@@ -4,6 +4,7 @@ from django import forms
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.utils import timezone
 
 from audit.events import AuditEvent
 from organizations.models import (
@@ -12,7 +13,10 @@ from organizations.models import (
     OrganizationSettings,
     UserOrganizationMembership,
 )
-from organizations.utils import is_valid_tenant_label
+from organizations.utils import (
+    is_valid_tenant_label,
+    validate_iana_timezone,
+)
 from programs.models import ProgramFeature
 
 
@@ -41,7 +45,7 @@ class PlatformOrganizationForm(forms.ModelForm):
     )
     time_zone = forms.CharField(
         max_length=50,
-        initial="America/New_York",
+        initial=timezone.get_default_timezone_name(),
         help_text="Primary time zone (e.g. 'America/New_York', 'America/Chicago').",
     )
     theme_color = forms.CharField(
@@ -130,6 +134,18 @@ class PlatformOrganizationForm(forms.ModelForm):
                     self.fields[key].initial = structured_data[key]
             # Hide initial lead mentor field on edit
             self.fields.pop("initial_lead_mentor_email", None)
+            time_zone_name = organization_data.get("time_zone")
+            if time_zone_name is None:
+                time_zone_name = structured_data.get("time_zone")
+            try:
+                self.fields["time_zone"].initial = validate_iana_timezone(
+                    time_zone_name
+                )
+            except ValidationError:
+                self.fields["time_zone"].initial = timezone.get_default_timezone_name()
+
+    def clean_time_zone(self):
+        return validate_iana_timezone(self.cleaned_data.get("time_zone"))
 
     def clean_slug(self):
         slug = (self.cleaned_data.get("slug") or "").strip().lower()

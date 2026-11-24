@@ -1,6 +1,6 @@
 """Tests for calendar_feeds views."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.contrib.auth.models import Group, User
 from django.test import TestCase
@@ -25,6 +25,7 @@ from calendar_feeds.tests.factories import (
     make_student_user,
 )
 from organizations.models import Organization, UserOrganizationMembership
+from organizations.utils import update_organization_settings
 
 
 class CalendarViewTests(TestCase):
@@ -427,6 +428,31 @@ class EventCreateViewTests(TestCase):
         )
         self.assertRedirects(resp, self.calendar_url)
         self.assertTrue(CalendarEvent.objects.filter(title="Test Event").exists())
+
+    def test_create_event_interprets_input_in_organization_timezone(self):
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/Chicago"}
+        )
+        self.client.login(username="lead", password="password123")  # nosec B106
+
+        response = self.client.post(
+            self.url,
+            {
+                "title": "Chicago Event",
+                "start_datetime": "2026-01-15T10:00",
+                "end_datetime": "2026-01-15T11:00",
+                "description": "",
+                "location": "",
+                "all_day": False,
+            },
+        )
+
+        self.assertRedirects(response, self.calendar_url)
+        event = CalendarEvent.objects.get(title="Chicago Event")
+        self.assertEqual(
+            event.start_datetime,
+            timezone.make_aware(datetime(2026, 1, 15, 16), timezone.UTC),
+        )
 
 
 class EventUpdateViewTests(TestCase):

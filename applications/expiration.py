@@ -9,13 +9,14 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from applications.identity_sync import delete_orphaned_incomplete_profiles
 from applications.models import Application, ApplicationDocumentSubmission
 from applications.services import (
     has_required_application_documents,
     required_application_documents_complete,
 )
 from audit.service import log_deletion
-from programs.models import Program
+from programs.models import Adult, Program, Student
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,11 @@ def _expire_locked(organization, application_pk, cutoff):
         if prepared_files is None:
             return "skipped"
         storage, file_names = prepared_files
+        profile_ids = (
+            (Student, application.student_profile_id),
+            (Adult, application.primary_guardian_profile_id),
+            (Adult, application.secondary_guardian_profile_id),
+        )
 
         audit_entry = log_deletion(
             resource=application,
@@ -179,6 +185,7 @@ def _expire_locked(organization, application_pk, cutoff):
         for name in file_names:
             storage.delete(name)
         application.delete()
+        delete_orphaned_incomplete_profiles(application, profile_ids)
         return "deleted"
 
 

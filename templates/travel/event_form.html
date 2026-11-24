@@ -50,7 +50,7 @@
                             <div class="col-12">
                                 <div class="form-check">
                                     {{ form.is_competition }}
-                                    <label for="{{ form.is_competition.id_for_label }}" class="form-check-label">Competition with a separate student attendance response</label>
+                                    <label for="{{ form.is_competition.id_for_label }}" class="form-check-label">{{ form.is_competition.label }}</label>
                                 </div>
                                 {% if form.is_competition.help_text %}<div class="form-text">{{ form.is_competition.help_text }}</div>{% endif %}
                                 {% if form.is_competition.errors %}<div class="text-danger small">{{ form.is_competition.errors }}</div>{% endif %}
