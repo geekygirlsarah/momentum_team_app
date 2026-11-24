@@ -11,10 +11,12 @@ import datetime
 import logging
 
 from django.core.management.base import BaseCommand
-from django.utils import timezone
 from django.utils.dateparse import parse_date
 
-from organizations.utils import get_organization_email_settings
+from organizations.utils import (
+    get_organization_email_settings,
+    get_organization_localdate,
+)
 from programs.services.digest import get_weekly_digest_recipients
 from programs.utils.notifications import send_templated_notification
 
@@ -166,7 +168,11 @@ class Command(BaseCommand):
                 or "Organization"
             )
 
-            ref_date = data.get("reference_date") or target_date or timezone.localdate()
+            ref_date = (
+                data.get("reference_date")
+                or target_date
+                or get_organization_localdate(organization)
+            )
             date_str = _format_ordinal_date(ref_date)
 
             if recip_role == "student":

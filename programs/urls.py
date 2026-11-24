@@ -40,6 +40,7 @@ from .views import (
     PortalSlidingScaleSettingsView,
     PortalSubteamView,
     PortalTeamView,
+    PortalTimeZoneSettingsView,
     ProgramApplicationQuestionCreateView,
     ProgramApplicationQuestionUpdateView,
     ProgramAssignmentView,
@@ -752,6 +753,11 @@ urlpatterns = [
         "settings/permissions/update/",
         PortalPermissionsUpdateView.as_view(),
         name="portal_permissions_update",
+    ),
+    path(
+        "settings/time-zone/",
+        PortalTimeZoneSettingsView.as_view(),
+        name="portal_time_zone_settings",
     ),
     path(
         "settings/lead-mentors/",

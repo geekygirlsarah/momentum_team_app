@@ -72,3 +72,9 @@ Reminders skip private feeds containing ACL rows owned by another organization a
 python manage.py send_calendar_reminders --days-ahead 3 [--dry-run]
 ```
 Uses `send_templated_notification` with template `templates/calendar_feeds/emails/reminder.html`.
+
+## Weekly Digest Calendar Times
+
+Organization time zones are selected from the installed IANA time-zone list by a Lead Mentor in the organization's Portal Settings. The setting accepts an IANA time-zone name (for example, `America/New_York`). Timed calendar recurrences are expanded in the organization's current time zone, so a weekly event stays at the same local wall time across daylight-saving transitions. The calendar page, iCalendar subscriptions, and weekly digest all use that zone for timed event dates and times; all-day events retain their calendar dates.
+
+Recurring events do not store the time zone in which they were originally entered. Their current UTC start is interpreted in the organization's configured time zone, so changing that setting also changes how existing timed series are displayed and expanded. Legacy organizations without a valid setting use Django's configured default time zone. Exception and exclusion identities remain based on their existing occurrence dates when the series is expanded or edited.

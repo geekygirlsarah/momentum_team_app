@@ -8,6 +8,7 @@ from django.urls import reverse
 from PIL import Image
 
 from organizations.models import Organization, OrganizationDomain
+from organizations.utils import update_organization_settings
 from programs.models import (
     Adult,
     Crew,
@@ -83,6 +84,52 @@ class SettingsUIImprovementsTests(TestCase):
 
     def _login(self, user):
         self.client.force_login(user)
+
+    def test_portal_time_zone_setting_is_editable_and_organization_scoped(self):
+        self._login(self.lead_user)
+        organization = self.program.organization
+        other_organization = Organization.objects.create(
+            name="Other Time Zone Organization", slug="other-time-zone"
+        )
+        update_organization_settings(other_organization, {"time_zone": "Europe/London"})
+
+        settings_response = self.client.get(reverse("portal_settings"))
+        self.assertEqual(settings_response.status_code, 200)
+        self.assertContains(settings_response, "<select")
+        self.assertContains(settings_response, 'id="organization_time_zone"')
+        self.assertContains(settings_response, '<option value="America/New_York"')
+        self.assertContains(settings_response, 'name="time_zone"')
+        self.assertContains(settings_response, "America/New_York")
+
+        response = self.client.post(
+            reverse("portal_time_zone_settings"),
+            {"time_zone": "America/Chicago"},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        organization.refresh_from_db()
+        other_organization.refresh_from_db()
+        self.assertEqual(organization.settings.get("time_zone"), "America/Chicago")
+        self.assertEqual(other_organization.settings.get("time_zone"), "Europe/London")
+
+        invalid_response = self.client.post(
+            reverse("portal_time_zone_settings"),
+            {"time_zone": "Invalid/Zone"},
+            follow=True,
+        )
+        organization.refresh_from_db()
+        self.assertContains(invalid_response, "Enter a valid IANA time zone.")
+        self.assertEqual(organization.settings.get("time_zone"), "America/Chicago")
+
+    def test_portal_time_zone_setting_requires_lead_mentor(self):
+        self._login(self.mentor_user)
+
+        response = self.client.post(
+            reverse("portal_time_zone_settings"),
+            {"time_zone": "America/Chicago"},
+        )
+
+        self.assertEqual(response.status_code, 403)
 
     def test_portal_settings_page_ui_and_sections(self):
         """Portal Settings should render all categorized tabs, permissions, teams, and imports cleanly."""

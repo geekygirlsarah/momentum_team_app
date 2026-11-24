@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from django.http import Http404
 from django.test import RequestFactory, TestCase
@@ -9,6 +10,7 @@ from calendar_feeds.models import CalendarFeed, EventException
 from calendar_feeds.tests.factories import make_event, make_feed, make_lead_mentor_user
 from calendar_feeds.views import _occurrence
 from organizations.models import Organization
+from organizations.utils import update_organization_settings
 
 
 class OccurrenceEditorTests(TestCase):
@@ -66,6 +68,53 @@ class OccurrenceEditorTests(TestCase):
         self.event.save()
         with self.assertRaises(Http404):
             _occurrence(request, self.event.pk, "2026-09-08")
+
+    def test_occurrence_lookup_uses_local_dst_time_and_utc_date_identity(self):
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/New_York"}
+        )
+        start = datetime(2026, 3, 1, 23, 30, tzinfo=ZoneInfo("America/New_York"))
+        event = make_event(
+            self.feed,
+            start_datetime=start,
+            end_datetime=start + timedelta(hours=1),
+            rrule_ical="FREQ=WEEKLY;COUNT=3",
+        )
+        request = RequestFactory().get("/")
+        request.user = self.user
+        request.organization = self.feed.organization
+
+        _, occurrence, _ = _occurrence(request, event.pk, "2026-03-09")
+
+        self.assertEqual(
+            occurrence,
+            datetime(2026, 3, 8, 23, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+    def test_occurrence_edit_interprets_input_in_organization_timezone(self):
+        update_organization_settings(
+            self.feed.organization, {"time_zone": "America/Chicago"}
+        )
+
+        response = self.client.post(
+            self.url("occurrence_edit"),
+            {
+                "title": self.event.title,
+                "location": self.event.location,
+                "description": "",
+                "start_datetime": "2026-09-09T10:00",
+                "end_datetime": "2026-09-09T11:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        exception = EventException.objects.get(
+            event=self.event, original_date=date(2026, 9, 8)
+        )
+        self.assertEqual(
+            exception.new_start_datetime,
+            timezone.make_aware(datetime(2026, 9, 9, 15), timezone.UTC),
+        )
 
     def test_foreign_exception_is_not_overwritten(self):
         other = Organization.objects.create(name="Other", slug="other-occurrence")

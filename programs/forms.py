@@ -1,5 +1,6 @@
 import datetime
 from decimal import Decimal
+from zoneinfo import available_timezones
 
 from django import forms
 from django.conf import settings
@@ -13,6 +14,7 @@ from organizations.forms import (
     OrganizationFormMixin,
     limit_choices_to_organization,
 )
+from organizations.utils import validate_iana_timezone
 from programs.utils import (
     GroupedProgramChoiceField,
     active_students,
@@ -1721,3 +1723,20 @@ class PaymentInstructionsForm(forms.Form):
         if value:
             URLValidator(schemes=["http", "https"])(value)
         return value
+
+
+class OrganizationTimeZoneForm(forms.Form):
+    auto_id = "organization_%s"
+
+    time_zone = forms.ChoiceField(
+        choices=[(zone, zone) for zone in sorted(available_timezones())],
+        error_messages={
+            "invalid_choice": "Enter a valid IANA time zone.",
+        },
+        widget=forms.Select(
+            attrs={"class": "form-select", "id": "organization_time_zone"}
+        ),
+    )
+
+    def clean_time_zone(self):
+        return validate_iana_timezone(self.cleaned_data.get("time_zone"))

@@ -1,10 +1,12 @@
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.db import models, transaction
+from django.utils import timezone
 from django.utils.functional import lazy
 
 from .domain_utils import (
@@ -22,6 +24,54 @@ from .models import (
 )
 
 _PAYMENT_URL_VALIDATOR = URLValidator(schemes=["http", "https"])
+
+
+def validate_iana_timezone(value: str) -> str:
+    """Return a normalized IANA time-zone name or reject the submitted value."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Enter a valid IANA time zone.")
+    time_zone_name = value.strip()
+    try:
+        ZoneInfo(time_zone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValidationError("Enter a valid IANA time zone.") from None
+    return time_zone_name
+
+
+def get_organization_timezone(organization):
+    """Return an organization's time zone, falling back safely for legacy data."""
+    organization_settings = getattr(organization, "settings", None)
+    time_zone_name = (
+        organization_settings.get("time_zone")
+        if hasattr(organization_settings, "get")
+        else None
+    )
+    if time_zone_name is None:
+        try:
+            structured_settings = organization.organization_settings
+        except (AttributeError, OrganizationSettings.DoesNotExist):
+            structured_settings = None
+        structured_data = getattr(structured_settings, "data", None)
+        if isinstance(structured_data, dict):
+            time_zone_name = structured_data.get("time_zone")
+    try:
+        return ZoneInfo(validate_iana_timezone(time_zone_name))
+    except ValidationError:
+        return timezone.get_default_timezone()
+
+
+def get_organization_timezone_name(organization) -> str:
+    """Return the IANA name for the organization's effective time zone."""
+    return getattr(
+        get_organization_timezone(organization),
+        "key",
+        timezone.get_default_timezone_name(),
+    )
+
+
+def get_organization_localdate(organization):
+    """Return today's date in an organization's effective time zone."""
+    return timezone.localdate(timezone=get_organization_timezone(organization))
 
 
 def _get_locked_organization_settings(organization):
