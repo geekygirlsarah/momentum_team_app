@@ -376,14 +376,36 @@ inside an existing `transaction.atomic()` block; it get-or-creates a claim row
 per normalized (trimmed, case-folded) email and returns them locked via
 `select_for_update()`, ordered by email to avoid deadlocking against another
 caller claiming the same emails in a different order. It takes no lock for a
-blank email. This is a coordination primitive only: it does not add a
-portal-wide email-uniqueness constraint, and a caller must still perform its
-own conflict check (and write) while holding the lock. `identity_sync.py`'s
-new-profile creation and authorized-edit paths are its first callers; no
-existing writer (`StudentForm`/`AdultForm`, the CSV import views, the alumni
-conversion helper, or the merge utilities) has been changed to take this lock,
-since doing so is a broader refactor across those call sites and was out of
-scope for this pass — see "Remaining Delivery Step 4 work" below.
+blank email. `claim_profile_instance_emails(instance, using=None)` is a
+convenience wrapper that claims a single `Student`/`Adult` instance's
+`personal_email` and `org_email` (a no-op if the instance has no organization
+yet). This is a coordination primitive only: it does not add a portal-wide
+email-uniqueness constraint, and a caller must still perform its own conflict
+check (and write) while holding the lock.
+
+Every profile-email writer identified in the original inventory now takes this
+lock immediately before its write, inside its own existing transaction:
+`identity_sync.py`'s new-profile creation and authorized-edit paths;
+`programs/forms.py`'s `StudentForm.save()`/`AdultForm.save()` (the portal's
+student/adult create and update views, including the admin-form subclass used
+by Django admin for editing); all four CSV import writers in
+`programs/views/imports.py` (student, parent, relationship, mentor row
+import/matching); `programs/utils/alumni.py`'s student-to-alumni conversion;
+and both merge paths in `programs/utils/merges.py`. No writer can create or
+change a Student/Adult email for an organization while another writer
+(including the wizard) holds the claim for that same normalized email.
+
+One narrow gap remains: Django admin's `StudentAdmin`/`ParentAdmin` call
+`form.save(commit=False)` and then a separate, unlocked `obj.save()` (Django's
+default `ModelAdmin.save_form`/`save_model` behavior), so the claim taken
+inside `StudentForm.save()`/`AdultForm.save()` is released before that second
+`obj.save()` runs; admin edits are not actually covered by the lock. Closing
+this properly means moving the claim into `Student.save()`/`Adult.save()`
+themselves (next to their existing revision-bump lock), which is a
+cross-cutting change to methods used by every Student/Adult write path
+project-wide and was left for a separately approved pass rather than done
+here. Django admin is superuser-only tooling, not the multi-org portal path
+the wizard's identity check needs to be race-free against.
 
 #### Maintenance and notification consumers migrated for version-1 applications
 
@@ -407,6 +429,37 @@ scope for this pass — see "Remaining Delivery Step 4 work" below.
   after the application row is gone, which deletes a captured profile only if
   it is still incomplete, in the same organization, and no longer referenced
   by any other application.
+- `programs/utils/merges.py`'s student and parent merges now also reassign
+  `Application.student_profile`/`primary_guardian_profile`/
+  `secondary_guardian_profile` from the discarded record to the merge
+  survivor (previously only `converted_student` was reassigned). Without
+  this, merging away a profile-workflow applicant's draft or activated
+  profile would silently `SET_NULL` the application's link to it.
+- `anonymize_emails` previously only reached `Student.objects`/`Adult.objects`
+  (which exclude incomplete profiles by design) and never touched
+  `ApplicationStudentDraft.personal_email`/`ApplicationGuardianDraft.email`,
+  so a profile-workflow applicant's or guardian's real email could survive a
+  dev-data anonymization pass. It now also reaches `Student.all_objects`/
+  `Adult.all_objects` and both typed draft models.
+- `report_application_answer_backfill` assumed every approved/converted
+  application has `converted_student` set and legacy `step6`/`step6-experience`
+  JSON answers. Neither is ever true for a `profile_workflow_version=1`
+  application (it finalizes onto `student_profile` instead and is never
+  converted through the legacy path), so every approved version-1
+  application was being misreported as "no linked student". It now skips
+  version-1 applications and reports the skipped count instead; they are
+  reviewed through the typed profile-workflow review screen, not this
+  report.
+- Checked and left unchanged: `move_application_documents`'s
+  `converted_student__isnull=False, status=CONVERTED` filter already
+  naturally excludes version-1 applications (which never set either field),
+  so it has no false-positive risk. The portal/organization dashboards and
+  digest emails do not reference applications at all.
+  `reencrypt_student_medical`'s last-resort recovery fallback (reading a
+  garbled medical field back out of legacy JSON) has no typed-draft
+  equivalent for a profile-workflow-derived student profile; this is a rare
+  disaster-recovery tool, not a routine report, so it was left as a known
+  limitation rather than expanded.
 
 #### Remaining Delivery Step 4 work and rollout status
 
@@ -420,17 +473,10 @@ approval until a lead resolves it, cross-organization reviewer denial, and
 staff document upload — but enabling the workflow for real public traffic is
 intentionally deferred because:
 
-- The email-coordination lock is not yet adopted by the other profile-email
-  writers (`programs/forms.py`'s `StudentForm`/`AdultForm`, the CSV import
-  views, `programs/utils/alumni.py`, `programs/utils/merges.py`). Those
-  writers can still race against a concurrent wizard submission or each other
-  for the same email; see "Profile-email write coordination" above.
 - Row-lock and claim-serialization behavior has only been exercised on
-  SQLite in this pass. PostgreSQL transaction/locking tests, required before
-  claiming concurrency readiness, were not run in this environment.
-- Broader reporting/maintenance consumers beyond reminders and expiration
-  (for example org-wide digests) were not separately re-audited for
-  version-1 awareness in this pass.
+  SQLite across both this pass and the prior one. PostgreSQL
+  transaction/locking tests, required before claiming concurrency readiness,
+  could not be run in this environment (port 5432 is not reachable here).
 
 Before typed records can fully replace JSON for every consumer, each remaining
 reader and writer must be migrated with the same application-row locking,

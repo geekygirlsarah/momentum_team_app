@@ -13,6 +13,7 @@ from django.core.exceptions import ValidationError
 from django.db import models, transaction
 
 from .accounts import transfer_user_account
+from .email_coordination import claim_profile_emails
 
 
 def carry_over_missing_fields(
@@ -145,6 +146,7 @@ def _validate_related_organization(
 
 
 def _validate_parent_merge_ownership(keep: Any, source: Any) -> None:
+    from applications.models import Application
     from attendance.models import AttendanceEvent, AttendanceSession, RFIDCard
     from outreach.models import OutreachMentorSignup
     from programs.models import (
@@ -295,6 +297,16 @@ def _validate_parent_merge_ownership(keep: Any, source: Any) -> None:
             ("organization_id", "org_email_sponsor__organization_id"),
             (),
         ),
+        (
+            Application.objects.filter(primary_guardian_profile_id__in=adult_ids),
+            ("organization_id", "primary_guardian_profile__organization_id"),
+            ("program__organization_id",),
+        ),
+        (
+            Application.objects.filter(secondary_guardian_profile_id__in=adult_ids),
+            ("organization_id", "secondary_guardian_profile__organization_id"),
+            ("program__organization_id",),
+        ),
     ):
         _validate_related_organization(model, organization_id, paths, optional)
 
@@ -440,6 +452,12 @@ def _validate_student_merge_ownership(keep: Any, source: Any) -> None:
         Application.objects.filter(converted_student_id__in=student_ids),
         organization_id,
         ("organization_id", "converted_student__organization_id"),
+        ("program__organization_id",),
+    )
+    _validate_related_organization(
+        Application.objects.filter(student_profile_id__in=student_ids),
+        organization_id,
+        ("organization_id", "student_profile__organization_id"),
         ("program__organization_id",),
     )
     answers = StudentApplicationAnswer.objects.filter(student_id__in=student_ids)
@@ -613,11 +631,27 @@ def _transfer_parent_rfid_and_attendance(keep: Any, source: Any) -> None:
     Student.objects.filter(org_email_sponsor=source).update(org_email_sponsor=keep)
 
 
+def _transfer_parent_application_profile_links(keep: Any, source: Any) -> None:
+    from applications.models import Application
+
+    # A profile-workflow application may still point at ``source`` as the
+    # isolated guardian profile it reviewed/activated; carry that link over
+    # so the application doesn't silently lose it (it would otherwise just
+    # go NULL via on_delete=SET_NULL once ``source`` is deleted below).
+    Application.objects.filter(primary_guardian_profile=source).update(
+        primary_guardian_profile=keep
+    )
+    Application.objects.filter(secondary_guardian_profile=source).update(
+        secondary_guardian_profile=keep
+    )
+
+
 def _transfer_parent_related_records(keep: Any, source: Any) -> None:
     _transfer_parent_background_checks(keep, source)
     _transfer_parent_agreements(keep, source)
     _transfer_parent_outreach_signups(keep, source)
     _transfer_parent_rfid_and_attendance(keep, source)
+    _transfer_parent_application_profile_links(keep, source)
 
 
 def _carry_over_missing_parent_fields(keep: Any, source: Any) -> bool:
@@ -712,6 +746,19 @@ def perform_parent_merge(keep: Any, source: Any) -> dict[str, Any]:
     with transaction.atomic():
         keep = model.objects.select_for_update().get(pk=keep_pk)
         source = model.objects.select_for_update().get(pk=source_pk)
+        # Coordinate with other profile-email writers (the application
+        # wizard, staff forms, imports, alumni conversion) before carrying
+        # an email over from source to keep, so a concurrent writer for the
+        # same organization/email can't interleave with this merge.
+        claim_profile_emails(
+            keep.organization,
+            [
+                keep.personal_email,
+                keep.org_email,
+                source.personal_email,
+                source.org_email,
+            ],
+        )
         _validate_parent_merge_ownership(keep, source)
         source_name = getattr(source, "display_name", str(source))
         keep_name = getattr(keep, "display_name", str(keep))
@@ -904,6 +951,11 @@ def _transfer_student_outreach_signups(keep: Any, source: Any) -> None:
     from outreach.models import OutreachSignup
 
     Application.objects.filter(converted_student=source).update(converted_student=keep)
+    # A profile-workflow application may still point at ``source`` as the
+    # isolated profile it reviewed/activated; carry that link over so the
+    # application doesn't silently lose it (it would otherwise just go
+    # NULL via on_delete=SET_NULL once ``source`` is deleted below).
+    Application.objects.filter(student_profile=source).update(student_profile=keep)
     StudentApplicationAnswer.objects.filter(student=source).update(student=keep)
 
     for signup in list(OutreachSignup.objects.filter(student=source)):
@@ -1059,6 +1111,19 @@ def perform_student_merge(keep: Any, source: Any) -> dict[str, Any]:
     with transaction.atomic():
         keep = model.objects.select_for_update().get(pk=keep_pk)
         source = model.objects.select_for_update().get(pk=source_pk)
+        # Coordinate with other profile-email writers (the application
+        # wizard, staff forms, imports, alumni conversion) before carrying
+        # an email over from source to keep, so a concurrent writer for the
+        # same organization/email can't interleave with this merge.
+        claim_profile_emails(
+            keep.organization,
+            [
+                keep.personal_email,
+                keep.org_email,
+                source.personal_email,
+                source.org_email,
+            ],
+        )
         _validate_student_merge_ownership(keep, source)
         source_name = getattr(source, "display_name", str(source))
         keep_name = getattr(keep, "display_name", str(keep))

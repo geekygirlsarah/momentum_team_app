@@ -5,6 +5,7 @@ from django import forms
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
+from django.db import transaction
 from django.db.models import Value
 from django.db.models.functions import Coalesce, Lower, NullIf
 
@@ -19,6 +20,7 @@ from programs.utils import (
     format_grade,
     get_academic_year_ending,
 )
+from programs.utils.email_coordination import claim_profile_instance_emails
 
 from .models import (
     Adult,
@@ -269,18 +271,26 @@ class StudentForm(forms.ModelForm):
                 instance.primary_contact = self.cleaned_data.get("primary_contact")
             if "secondary_contact" in self.fields:
                 instance.secondary_contact = self.cleaned_data.get("secondary_contact")
-        if commit:
-            instance.save()
-        # After instance exists, sync the reverse M2M to Parents ensuring Primary/Secondary are included
-        if hasattr(self, "cleaned_data") and "parents" in self.cleaned_data:
-            selected = set(self.cleaned_data.get("parents", []))
-            for p in (instance.primary_contact, instance.secondary_contact):
-                if p:
-                    selected.add(p)
-            # Ensure instance has a PK in case commit=False was used
-            if not instance.pk:
+        # Coordinate with other profile-email writers (the application
+        # wizard, imports, alumni conversion, merges) before writing, so a
+        # concurrent writer for the same organization/email can't interleave
+        # with this save. Pure serialization: it does not change which
+        # emails are accepted, only when a conflicting write may proceed.
+        using = instance._state.db or "default"
+        with transaction.atomic(using=using):
+            claim_profile_instance_emails(instance, using=using)
+            if commit:
                 instance.save()
-            instance.adults.set(selected)
+            # After instance exists, sync the reverse M2M to Parents ensuring Primary/Secondary are included
+            if hasattr(self, "cleaned_data") and "parents" in self.cleaned_data:
+                selected = set(self.cleaned_data.get("parents", []))
+                for p in (instance.primary_contact, instance.secondary_contact):
+                    if p:
+                        selected.add(p)
+                # Ensure instance has a PK in case commit=False was used
+                if not instance.pk:
+                    instance.save()
+                instance.adults.set(selected)
         # Return the instance
         return instance
 
@@ -414,6 +424,21 @@ class AdultForm(forms.ModelForm):
             self.instance.validate_unique(exclude=exclude)
         except forms.ValidationError as e:
             self._update_errors(e)
+
+    def save(self, commit=True):
+        # Coordinate with other profile-email writers (the application
+        # wizard, imports, alumni conversion, merges) before writing, so a
+        # concurrent writer for the same organization/email can't interleave
+        # with this save. Pure serialization: it does not change which
+        # emails are accepted, only when a conflicting write may proceed.
+        instance = super().save(commit=False)
+        using = instance._state.db or "default"
+        with transaction.atomic(using=using):
+            claim_profile_instance_emails(instance, using=using)
+            if commit:
+                instance.save()
+                self.save_m2m()
+        return instance
 
     class Meta:
         model = Adult

@@ -6,7 +6,11 @@ from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from applications.models import Application
+from applications.models import (
+    Application,
+    ApplicationGuardianDraft,
+    ApplicationStudentDraft,
+)
 from programs.models import Adult, Student
 
 try:
@@ -63,10 +67,13 @@ class Command(BaseCommand):
         adult_count = 0
         user_count = 0
         app_count = 0
+        draft_count = 0
 
         with transaction.atomic():
-            # 1. Students
-            for student in Student.objects.all():
+            # 1. Students (``all_objects`` also reaches the isolated,
+            # incomplete profiles a profile-workflow application creates
+            # for a new applicant/guardian before lead approval).
+            for student in Student.all_objects.all():
                 updated = False
                 if student.personal_email:
                     new_personal = f"student_{student.pk}@{domain}"
@@ -83,8 +90,8 @@ class Command(BaseCommand):
                     if not dry_run:
                         student.save(update_fields=["personal_email", "org_email"])
 
-            # 2. Adults
-            for adult in Adult.objects.all():
+            # 2. Adults (``all_objects``, for the same reason as above)
+            for adult in Adult.all_objects.all():
                 updated = False
                 if adult.personal_email:
                     new_personal = f"adult_{adult.pk}@{domain}"
@@ -153,6 +160,37 @@ class Command(BaseCommand):
                                             )
                         app.save(update_fields=["email", "data"])
 
+            # 5. Profile-workflow typed drafts: these hold the applicant's
+            # and guardian's real email before (or instead of) any isolated
+            # profile exists, and aren't part of the JSON ``data`` scrubbed
+            # above.
+            for draft in (
+                ApplicationStudentDraft.objects.select_for_update()
+                .filter(personal_email__isnull=False)
+                .exclude(personal_email="")
+            ):
+                new_email = f"application_{draft.application_id}_student@{domain}"
+                if draft.personal_email != new_email:
+                    draft_count += 1
+                    if not dry_run:
+                        draft.personal_email = new_email
+                        draft.save(update_fields=["personal_email"])
+
+            for guardian_draft in (
+                ApplicationGuardianDraft.objects.select_for_update()
+                .filter(email__isnull=False)
+                .exclude(email="")
+            ):
+                new_email = (
+                    f"application_{guardian_draft.application_id}_"
+                    f"{guardian_draft.slot}@{domain}"
+                )
+                if guardian_draft.email != new_email:
+                    draft_count += 1
+                    if not dry_run:
+                        guardian_draft.email = new_email
+                        guardian_draft.save(update_fields=["email"])
+
             if dry_run:
                 transaction.set_rollback(True)
 
@@ -160,6 +198,7 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"{prefix}Completed: "
                 f"{student_count} student(s), {adult_count} adult(s), "
-                f"{user_count} user(s), {app_count} application(s) anonymized."
+                f"{user_count} user(s), {app_count} application(s), "
+                f"{draft_count} application draft(s) anonymized."
             )
         )

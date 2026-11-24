@@ -34,6 +34,28 @@ def normalize_claim_email(email: str | None) -> str:
     return (email or "").strip().casefold()
 
 
+def claim_profile_instance_emails(instance, *, using=None):
+    """Claim the coordination lock for one ``Student``/``Adult`` instance's emails.
+
+    Convenience wrapper around :func:`claim_profile_emails` for a writer that
+    is about to create or save a single profile instance. Must be called
+    inside the same ``transaction.atomic()`` block as the write, before it.
+    A no-op when the instance has no organization yet (nothing to scope the
+    lock to).
+    """
+    organization = getattr(instance, "organization", None)
+    if organization is None:
+        return []
+    return claim_profile_emails(
+        organization,
+        [
+            getattr(instance, "personal_email", None),
+            getattr(instance, "org_email", None),
+        ],
+        using=using,
+    )
+
+
 def claim_profile_emails(organization, emails: Iterable[str | None], *, using=None):
     """Lock the claim rows for ``emails`` in ``organization`` and return them.
 

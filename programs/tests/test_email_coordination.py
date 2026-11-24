@@ -4,9 +4,11 @@ from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 
 from organizations.models import Organization
+from programs.models import Student
 from programs.models.email_claims import ProfileEmailClaim
 from programs.utils.email_coordination import (
     claim_profile_emails,
+    claim_profile_instance_emails,
     normalize_claim_email,
 )
 
@@ -103,3 +105,37 @@ class ClaimProfileEmailsTests(TestCase):
         with transaction.atomic():
             locked = claim_profile_emails(self.org, ["pat@example.com"])
         self.assertEqual(len(locked), 1)
+
+
+class ClaimProfileInstanceEmailsTests(TestCase):
+    """Tests for the single-instance convenience wrapper used by the
+    student/adult forms, CSV imports, alumni conversion, and merge writers."""
+
+    def setUp(self):
+        self.org = Organization.objects.get(slug="gos")
+
+    def test_claims_both_personal_and_org_email(self):
+        student = Student(
+            organization=self.org,
+            legal_first_name="Pat",
+            last_name="Doe",
+            personal_email="pat@example.com",
+            org_email="pdoe@org.example.com",
+        )
+        with transaction.atomic():
+            claim_profile_instance_emails(student)
+        self.assertEqual(
+            set(
+                ProfileEmailClaim.objects.filter(organization=self.org).values_list(
+                    "normalized_email", flat=True
+                )
+            ),
+            {"pat@example.com", "pdoe@org.example.com"},
+        )
+
+    def test_no_organization_is_a_no_op(self):
+        student = Student(legal_first_name="Pat", last_name="Doe", organization=None)
+        with transaction.atomic():
+            locked = claim_profile_instance_emails(student)
+        self.assertEqual(locked, [])
+        self.assertEqual(ProfileEmailClaim.objects.count(), 0)

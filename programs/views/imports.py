@@ -4,6 +4,7 @@ from django.contrib.auth.mixins import (
     PermissionRequiredMixin,
     UserPassesTestMixin,
 )
+from django.db import transaction
 from django.http import Http404
 from django.shortcuts import redirect, render
 from django.views.generic import View
@@ -21,6 +22,7 @@ from ..models import (
     Student,
 )
 from ..utils import redirect_back
+from ..utils.email_coordination import claim_profile_emails
 from .mixins import TenantLeadMentorPermissionRequiredMixin, logger
 
 
@@ -148,48 +150,55 @@ class StudentImportView(
                 return None
 
             def get_or_create_parent(first, last, email):
-                parents = Adult.objects.for_organization(organization)
-                # Try to find by email first
-                if email:
-                    p = parents.filter(personal_email__iexact=email).first()
-                    if p:
-                        if overwrite:
-                            changed_parent = False
-                            if first and p.legal_first_name != first:
-                                p.legal_first_name = first
-                                changed_parent = True
-                            if last and p.last_name != last:
-                                p.last_name = last
-                                changed_parent = True
-                            if changed_parent:
+                # Coordinate with other profile-email writers (the
+                # application wizard, staff forms, alumni conversion,
+                # merges) before checking/writing this email, so a
+                # concurrent writer for the same organization/email can't
+                # interleave with this import row.
+                with transaction.atomic():
+                    claim_profile_emails(organization, [email])
+                    parents = Adult.objects.for_organization(organization)
+                    # Try to find by email first
+                    if email:
+                        p = parents.filter(personal_email__iexact=email).first()
+                        if p:
+                            if overwrite:
+                                changed_parent = False
+                                if first and p.legal_first_name != first:
+                                    p.legal_first_name = first
+                                    changed_parent = True
+                                if last and p.last_name != last:
+                                    p.last_name = last
+                                    changed_parent = True
+                                if changed_parent:
+                                    p.save()
+                            return p
+                    # Next try by name match
+                    if first and last:
+                        p = parents.filter(
+                            legal_first_name__iexact=first, last_name__iexact=last
+                        ).first()
+                        if p:
+                            if (
+                                overwrite
+                                and email
+                                and (p.personal_email or "").lower()
+                                != (email or "").lower()
+                            ):
+                                p.personal_email = email
                                 p.save()
-                        return p
-                # Next try by name match
-                if first and last:
-                    p = parents.filter(
-                        legal_first_name__iexact=first, last_name__iexact=last
-                    ).first()
-                    if p:
-                        if (
-                            overwrite
-                            and email
-                            and (p.personal_email or "").lower()
-                            != (email or "").lower()
-                        ):
-                            p.personal_email = email
-                            p.save()
-                        return p
-                # If we have at least one of name or email, create
-                if first or last or email:
-                    return Adult.objects.create(
-                        organization=organization,
-                        legal_first_name=first
-                        or (email.split("@")[0] if email else "Parent"),
-                        last_name=last or "(contact)",
-                        personal_email=email or None,
-                        is_parent=True,
-                    )
-                return None
+                            return p
+                    # If we have at least one of name or email, create
+                    if first or last or email:
+                        return Adult.objects.create(
+                            organization=organization,
+                            legal_first_name=first
+                            or (email.split("@")[0] if email else "Parent"),
+                            last_name=last or "(contact)",
+                            personal_email=email or None,
+                            is_parent=True,
+                        )
+                    return None
 
             for d in rows:
                 first = val(d, "first_name", "First Name", "Preferred First Name")
@@ -255,81 +264,90 @@ class StudentImportView(
                 if grad and str(grad).isdigit():
                     grad_year = int(str(grad))
 
-                obj, created_flag = Student.objects.for_organization(
-                    organization
-                ).get_or_create(
-                    organization=organization,
-                    last_name=last,
-                    legal_first_name=legal_first,
-                    defaults={
-                        "preferred_first_name": first if first != legal_first else None,
-                        "pronouns": pronouns,
-                        "date_of_birth": dob,
-                        "address": address,
-                        "city": city,
-                        "state": state,
-                        "zip_code": zip_code,
-                        "phone_number": cell_phone,
-                        "phone_type": "cell",
-                        "can_receive_texts": True,
-                        "personal_email": personal_email,
-                        "org_account_id": org_account_id,
-                        "org_email": org_email,
-                        "tshirt_size": tshirt_size,
-                        "seen_once": seen_once if seen_once is not None else False,
-                        "on_discord": on_discord if on_discord is not None else False,
-                        "discord_handle": discord_handle,
-                        "school": school,
-                        "graduation_year": grad_year,
-                        "graduated": graduated if graduated is not None else False,
-                    },
-                )
-                if created_flag:
-                    created += 1
-                elif overwrite:
-                    changed = False
-                    # Strings and relations
-                    for field, value in [
-                        ("preferred_first_name", first),
-                        ("pronouns", pronouns),
-                        ("address", address),
-                        ("city", city),
-                        ("state", state),
-                        ("zip_code", zip_code),
-                        ("phone_number", cell_phone),
-                        ("phone_type", "cell"),
-                        ("can_receive_texts", True),
-                        ("personal_email", personal_email),
-                        ("org_account_id", org_account_id),
-                        ("org_email", org_email),
-                        ("tshirt_size", tshirt_size),
-                        ("discord_handle", discord_handle),
-                    ]:
-                        if value and getattr(obj, field) != value:
-                            setattr(obj, field, value)
+                # Coordinate with other profile-email writers before
+                # checking/writing this row's emails, so a concurrent writer
+                # for the same organization/email can't interleave with it.
+                with transaction.atomic():
+                    claim_profile_emails(organization, [personal_email, org_email])
+                    obj, created_flag = Student.objects.for_organization(
+                        organization
+                    ).get_or_create(
+                        organization=organization,
+                        last_name=last,
+                        legal_first_name=legal_first,
+                        defaults={
+                            "preferred_first_name": (
+                                first if first != legal_first else None
+                            ),
+                            "pronouns": pronouns,
+                            "date_of_birth": dob,
+                            "address": address,
+                            "city": city,
+                            "state": state,
+                            "zip_code": zip_code,
+                            "phone_number": cell_phone,
+                            "phone_type": "cell",
+                            "can_receive_texts": True,
+                            "personal_email": personal_email,
+                            "org_account_id": org_account_id,
+                            "org_email": org_email,
+                            "tshirt_size": tshirt_size,
+                            "seen_once": seen_once if seen_once is not None else False,
+                            "on_discord": (
+                                on_discord if on_discord is not None else False
+                            ),
+                            "discord_handle": discord_handle,
+                            "school": school,
+                            "graduation_year": grad_year,
+                            "graduated": graduated if graduated is not None else False,
+                        },
+                    )
+                    if created_flag:
+                        created += 1
+                    elif overwrite:
+                        changed = False
+                        # Strings and relations
+                        for field, value in [
+                            ("preferred_first_name", first),
+                            ("pronouns", pronouns),
+                            ("address", address),
+                            ("city", city),
+                            ("state", state),
+                            ("zip_code", zip_code),
+                            ("phone_number", cell_phone),
+                            ("phone_type", "cell"),
+                            ("can_receive_texts", True),
+                            ("personal_email", personal_email),
+                            ("org_account_id", org_account_id),
+                            ("org_email", org_email),
+                            ("tshirt_size", tshirt_size),
+                            ("discord_handle", discord_handle),
+                        ]:
+                            if value and getattr(obj, field) != value:
+                                setattr(obj, field, value)
+                                changed = True
+                        if dob and obj.date_of_birth != dob:
+                            obj.date_of_birth = dob
                             changed = True
-                    if dob and obj.date_of_birth != dob:
-                        obj.date_of_birth = dob
-                        changed = True
-                    if school and obj.school != school:
-                        obj.school = school
-                        changed = True
-                    if grad_year and obj.graduation_year != grad_year:
-                        obj.graduation_year = grad_year
-                        changed = True
-                    # Booleans (allow False updates)
-                    if seen_once is not None and obj.seen_once != seen_once:
-                        obj.seen_once = seen_once
-                        changed = True
-                    if on_discord is not None and obj.on_discord != on_discord:
-                        obj.on_discord = on_discord
-                        changed = True
-                    if graduated is not None and obj.graduated != graduated:
-                        obj.graduated = graduated
-                        changed = True
-                    if changed:
-                        obj.save()
-                        updated += 1
+                        if school and obj.school != school:
+                            obj.school = school
+                            changed = True
+                        if grad_year and obj.graduation_year != grad_year:
+                            obj.graduation_year = grad_year
+                            changed = True
+                        # Booleans (allow False updates)
+                        if seen_once is not None and obj.seen_once != seen_once:
+                            obj.seen_once = seen_once
+                            changed = True
+                        if on_discord is not None and obj.on_discord != on_discord:
+                            obj.on_discord = on_discord
+                            changed = True
+                        if graduated is not None and obj.graduated != graduated:
+                            obj.graduated = graduated
+                            changed = True
+                        if changed:
+                            obj.save()
+                            updated += 1
 
                 # Map race/ethnicity text to multi-select options
                 try:
@@ -504,45 +522,50 @@ class ParentImportView(
                     "Phone",
                     "Phone Number",
                 )
-                obj, created_flag = Adult.objects.for_organization(
-                    organization
-                ).get_or_create(
-                    organization=organization,
-                    legal_first_name=first,
-                    last_name=last,
-                    defaults={
-                        "personal_email": email,
-                        "phone_number": phone,
-                        "phone_type": "cell",
-                        "can_receive_texts": True,
-                        "is_parent": True,
-                    },
-                )
-                if created_flag:
-                    created += 1
-                else:
-                    changed = False
-                    if not obj.is_parent:
-                        obj.is_parent = True
-                        changed = True
+                # Coordinate with other profile-email writers before
+                # checking/writing this row's email, so a concurrent writer
+                # for the same organization/email can't interleave with it.
+                with transaction.atomic():
+                    claim_profile_emails(organization, [email])
+                    obj, created_flag = Adult.objects.for_organization(
+                        organization
+                    ).get_or_create(
+                        organization=organization,
+                        legal_first_name=first,
+                        last_name=last,
+                        defaults={
+                            "personal_email": email,
+                            "phone_number": phone,
+                            "phone_type": "cell",
+                            "can_receive_texts": True,
+                            "is_parent": True,
+                        },
+                    )
+                    if created_flag:
+                        created += 1
+                    else:
+                        changed = False
+                        if not obj.is_parent:
+                            obj.is_parent = True
+                            changed = True
 
-                    if not overwrite:
+                        if not overwrite:
+                            if changed:
+                                obj.save(update_fields=["is_parent", "updated_at"])
+                                updated += 1
+                            continue
+
+                        if email and obj.personal_email != email:
+                            obj.personal_email = email
+                            changed = True
+                        if phone and obj.phone_number != phone:
+                            obj.phone_number = phone
+                            obj.phone_type = "cell"
+                            obj.can_receive_texts = True
+                            changed = True
                         if changed:
-                            obj.save(update_fields=["is_parent", "updated_at"])
+                            obj.save()
                             updated += 1
-                        continue
-
-                    if email and obj.personal_email != email:
-                        obj.personal_email = email
-                        changed = True
-                    if phone and obj.phone_number != phone:
-                        obj.phone_number = phone
-                        obj.phone_type = "cell"
-                        obj.can_receive_texts = True
-                        changed = True
-                    if changed:
-                        obj.save()
-                        updated += 1
             messages.success(
                 request, f"Imported {created} new, updated {updated}. Skipped {errors}."
             )
@@ -731,14 +754,19 @@ class RelationshipImportView(
                 if not p:
                     if dry_run or not can_create_parents:
                         return None, False, True  # would create
-                    p = Adult.objects.create(
-                        organization=organization,
-                        legal_first_name=first
-                        or (email.split("@")[0] if email else "Parent"),
-                        last_name=last or "(contact)",
-                        personal_email=email or None,
-                        is_parent=True,
-                    )
+                    # Coordinate with other profile-email writers before
+                    # creating, so a concurrent writer for the same
+                    # organization/email can't interleave with this row.
+                    with transaction.atomic():
+                        claim_profile_emails(organization, [email])
+                        p = Adult.objects.create(
+                            organization=organization,
+                            legal_first_name=first
+                            or (email.split("@")[0] if email else "Parent"),
+                            last_name=last or "(contact)",
+                            personal_email=email or None,
+                            is_parent=True,
+                        )
                     created = True
                 else:
                     # If we found existing Adult but not flagged as parent, set it
@@ -968,46 +996,51 @@ class MentorImportView(
                     d, "org_account_id", "andrew_id", "Andrew ID", "AndrewID"
                 )
                 role = val(d, "role", "Role") or "mentor"
-                obj, created_flag = Adult.objects.for_organization(
-                    organization
-                ).get_or_create(
-                    organization=organization,
-                    legal_first_name=first,
-                    last_name=last,
-                    defaults={
-                        "personal_email": email,
-                        "org_email": org_email,
-                        "org_account_id": org_account_id,
-                        "role": role,
-                        "is_mentor": True,
-                    },
-                )
-                if created_flag:
-                    created += 1
-                else:
-                    changed = False
-                    if not obj.is_mentor:
-                        obj.is_mentor = True
-                        changed = True
-
-                    if not overwrite:
-                        if changed:
-                            obj.save(update_fields=["is_mentor", "updated_at"])
-                            updated += 1
-                        continue
-
-                    for field, value in [
-                        ("personal_email", email),
-                        ("org_email", org_email),
-                        ("org_account_id", org_account_id),
-                        ("role", role),
-                    ]:
-                        if value and getattr(obj, field) != value:
-                            setattr(obj, field, value)
+                # Coordinate with other profile-email writers before
+                # checking/writing this row's emails, so a concurrent writer
+                # for the same organization/email can't interleave with it.
+                with transaction.atomic():
+                    claim_profile_emails(organization, [email, org_email])
+                    obj, created_flag = Adult.objects.for_organization(
+                        organization
+                    ).get_or_create(
+                        organization=organization,
+                        legal_first_name=first,
+                        last_name=last,
+                        defaults={
+                            "personal_email": email,
+                            "org_email": org_email,
+                            "org_account_id": org_account_id,
+                            "role": role,
+                            "is_mentor": True,
+                        },
+                    )
+                    if created_flag:
+                        created += 1
+                    else:
+                        changed = False
+                        if not obj.is_mentor:
+                            obj.is_mentor = True
                             changed = True
-                    if changed:
-                        obj.save()
-                        updated += 1
+
+                        if not overwrite:
+                            if changed:
+                                obj.save(update_fields=["is_mentor", "updated_at"])
+                                updated += 1
+                            continue
+
+                        for field, value in [
+                            ("personal_email", email),
+                            ("org_email", org_email),
+                            ("org_account_id", org_account_id),
+                            ("role", role),
+                        ]:
+                            if value and getattr(obj, field) != value:
+                                setattr(obj, field, value)
+                                changed = True
+                        if changed:
+                            obj.save()
+                            updated += 1
             messages.success(
                 request, f"Imported {created} new, updated {updated}. Skipped {errors}."
             )

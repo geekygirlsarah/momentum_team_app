@@ -13,6 +13,7 @@ from django.urls import reverse
 
 from programs.forms import AdultForm
 from programs.models import Adult
+from programs.models.email_claims import ProfileEmailClaim
 
 User = get_user_model()
 
@@ -138,6 +139,32 @@ class AdultCreateViewTest(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(
             Adult.objects.filter(personal_email="shared@example.com").count(), 2
+        )
+
+    def test_post_adult_create_claims_email_for_coordination(self):
+        """Saving must take the cross-writer email lock so a concurrent
+        writer (e.g. the application wizard) can't race this save."""
+        url = reverse("adult_create")
+        response = self.client.post(
+            url,
+            {
+                "legal_first_name": "Casey",
+                "last_name": "Reed",
+                "personal_email": "casey.reed@example.com",
+                "email_updates": False,
+                "is_parent": True,
+                "is_mentor": False,
+                "is_alumni": False,
+                "login_enabled": True,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        adult = Adult.objects.get(personal_email="casey.reed@example.com")
+        self.assertTrue(
+            ProfileEmailClaim.objects.filter(
+                organization=adult.organization,
+                normalized_email="casey.reed@example.com",
+            ).exists()
         )
 
 
