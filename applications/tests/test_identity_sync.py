@@ -488,6 +488,80 @@ class RaceConditionTests(IdentitySyncTestCase):
         )
 
 
+class StaleAuthorizationRecheckTests(IdentitySyncTestCase):
+    """A concurrent writer can invalidate an authorization decision between
+    the unlocked check in sync_student_identity/sync_guardian_identity and
+    the locked write in _apply_direct_edit. The edit must be blocked rather
+    than applied under the now-stale authorization."""
+
+    def test_relationship_removed_between_check_and_lock_blocks_the_edit(self):
+        student = Student.objects.create(
+            organization=self.organization,
+            legal_first_name="Riley",
+            last_name="Old",
+        )
+        guardian = Adult.objects.create(
+            organization=self.organization,
+            legal_first_name="Jamie",
+            last_name="Guardian",
+            personal_email="jamie-race@example.test",
+            is_parent=True,
+        )
+        relationship = AdultStudentRelationship.objects.create(
+            organization=self.organization,
+            adult=guardian,
+            student=student,
+            relationship_to_student="parent",
+        )
+        application, request = self._verified_application(
+            Application.Type.PARENT, "jamie-race@example.test"
+        )
+        draft = self._student_draft(
+            application,
+            legal_first_name="Riley",
+            last_name="Returning",
+            personal_email="",
+        )
+
+        from applications.identity import (
+            evaluate_application_profile_edit as real_evaluate_application_profile_edit,
+        )
+
+        calls = {"n": 0}
+
+        def fake_evaluate(req, app, target_profile):
+            calls["n"] += 1
+            authorization = real_evaluate_application_profile_edit(
+                req, app, target_profile
+            )
+            if calls["n"] == 1:
+                # Simulate another request (e.g. a lead mentor editing the
+                # family) removing the relationship this very authorization
+                # just relied on, right after the unlocked check passes.
+                relationship.delete()
+            return authorization
+
+        with patch(
+            "applications.identity_sync.evaluate_application_profile_edit",
+            side_effect=fake_evaluate,
+        ):
+            result = sync_student_identity(
+                application, draft, request=request, existing_student=student
+            )
+
+        # The first (unlocked) check saw the authorized state...
+        self.assertEqual(
+            result.authorization, ApplicationProfileEditAuthorization.LINKED_STUDENT
+        )
+        # ...but the write itself was blocked by the post-lock recheck.
+        self.assertIsNone(result.profile)
+        student.refresh_from_db()
+        self.assertEqual(student.last_name, "Old")  # not edited
+        application.refresh_from_db()
+        self.assertIsNone(application.student_profile_id)
+        self.assertEqual(calls["n"], 2)
+
+
 class RelationshipProposalTests(IdentitySyncTestCase):
     def test_present_guardian_creates_an_add_proposal(self):
         application, _ = self._verified_application(

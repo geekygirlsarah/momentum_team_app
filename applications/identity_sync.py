@@ -227,6 +227,20 @@ def _apply_direct_edit(application, profile, draft, field_map, *, request, using
         raise ApplicationIdentitySyncConflict(
             "The matched profile is no longer available for a direct edit."
         )
+    # The caller already evaluated authorization against an *unlocked* read of
+    # this profile. Re-evaluate it against the just-locked row before writing
+    # anything: a concurrent writer could have unlinked the requester's
+    # account, removed the guardian relationship this authorization relied
+    # on, or otherwise changed the facts between that check and this lock.
+    # Without this recheck, a now-stale authorization would still apply the
+    # edit under the fresh lock.
+    if (
+        evaluate_application_profile_edit(request, application, locked)
+        not in _AUTHORIZED_EDIT_STATES
+    ):
+        raise ApplicationIdentitySyncConflict(
+            "Authorization for this profile changed while applying the edit."
+        )
     before = {"personal_email": locked.personal_email}
     changed_fields = []
     for draft_field, profile_field in field_map.items():

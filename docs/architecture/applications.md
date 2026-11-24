@@ -473,10 +473,23 @@ approval until a lead resolves it, cross-organization reviewer denial, and
 staff document upload — but enabling the workflow for real public traffic is
 intentionally deferred because:
 
-- Row-lock and claim-serialization behavior has only been exercised on
-  SQLite across both this pass and the prior one. PostgreSQL
-  transaction/locking tests, required before claiming concurrency readiness,
-  could not be run in this environment (port 5432 is not reachable here).
+- A previously identified stale-authorization race in `applications/identity_sync.py`
+  is now fixed: `_apply_direct_edit` re-evaluates `evaluate_application_profile_edit`
+  against the just-locked profile before writing, instead of trusting the
+  caller's earlier unlocked check, so a concurrent change to the authorizing
+  fact (e.g. a guardian relationship removed between the check and the lock)
+  blocks the edit rather than applying it under stale authorization
+  (`test_identity_sync.py::StaleAuthorizationRecheckTests`).
+- `programs/utils/email_coordination.py`'s claim lock now has a genuine
+  multi-threaded regression (`test_email_coordination.py::ClaimProfileEmailsConcurrencyTests`)
+  that runs two concurrent writers on separate threads/connections against the
+  same (organization, email) pair. This environment cannot reach PostgreSQL
+  (port 5432 is not reachable here), so locally it only exercises the
+  sequential SQLite fallback; CI's `ci.yml` runs the suite against a real
+  `postgres:16` service, so this is the first test that can give genuine
+  row-lock evidence there. It must be observed passing in CI before treating
+  concurrency as verified — this repository checkout has not seen that result
+  for this exact change.
 
 Before typed records can fully replace JSON for every consumer, each remaining
 reader and writer must be migrated with the same application-row locking,
@@ -508,7 +521,7 @@ writes, handoff, submission, and applicant document uploads advance that clock;
 OTP activity, staff edits, and reminder delivery do not. Older applications
 without the field use `updated_at` as the approximate inactivity clock, which
 may reflect OTP or staff activity. Inactivity reminders become due after 48
-hours. A deadline reminder is due from two date-days before `applications_close`
+hours. A deadline reminder is due from three date-days before `applications_close`
 through the inclusive closing date, using `timezone.now().date()`; programs with
 no close date have no deadline reminder, and applications for closed windows are
 not reminded.

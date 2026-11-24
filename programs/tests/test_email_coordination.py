@@ -1,6 +1,9 @@
 """Tests for the tenant-scoped profile-email coordination lock."""
 
-from django.db import transaction
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+from django.db import close_old_connections, connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
 
 from organizations.models import Organization
@@ -141,3 +144,69 @@ class ClaimProfileInstanceEmailsTests(TestCase):
             locked = claim_profile_instance_emails(student)
         self.assertEqual(locked, [])
         self.assertEqual(ProfileEmailClaim.objects.count(), 0)
+
+
+class ClaimProfileEmailsConcurrencyTests(TransactionTestCase):
+    """Real, multi-threaded proof that the lock serializes two concurrent
+    "does this email already exist? if not, create it" writers for the same
+    (organization, email) pair, the exact race the wizard's identity sync and
+    every other profile-email writer depend on this lock to prevent.
+
+    SQLite's ``select_for_update`` does not take a real row lock
+    (``connection.features.has_select_for_update`` is False), so there only
+    the sequential fallback below is meaningful; PostgreSQL (used by CI) runs
+    the two writers on genuinely separate threads/connections and proves the
+    second one blocks until the first's transaction finishes."""
+
+    def setUp(self):
+        self.organization = Organization.objects.create(
+            name="Email Claim Concurrency",
+            slug="email-claim-concurrency",
+            subdomain="email-claim-concurrency",
+        )
+
+    def _claim_then_create_if_absent(self, email, barrier=None):
+        close_old_connections()
+        try:
+            if barrier is not None:
+                barrier.wait(timeout=10)
+            with transaction.atomic():
+                claim_profile_emails(self.organization, [email])
+                if Student.objects.filter(
+                    organization=self.organization, personal_email__iexact=email
+                ).exists():
+                    return None
+                return Student.objects.create(
+                    organization=self.organization,
+                    legal_first_name="Pat",
+                    last_name="Doe",
+                    personal_email=email,
+                )
+        finally:
+            connections.close_all()
+
+    def test_only_one_concurrent_writer_creates_the_profile(self):
+        email = "concurrent-claim@example.test"
+        if connection.features.has_select_for_update:
+            barrier = Barrier(2)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        lambda _: self._claim_then_create_if_absent(email, barrier),
+                        range(2),
+                    )
+                )
+        else:
+            results = [
+                self._claim_then_create_if_absent(email),
+                self._claim_then_create_if_absent(email),
+            ]
+
+        created = [result for result in results if result is not None]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(
+            Student.objects.filter(
+                organization=self.organization, personal_email__iexact=email
+            ).count(),
+            1,
+        )

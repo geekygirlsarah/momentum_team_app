@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-11-24
+
+### Fixed
+- Deadline reminders for an unfinished application are now due starting three days before the program's application window closes, matching the originally requested timing, instead of two.
+- A profile-workflow application's direct edit to a student or guardian profile is no longer applied if the authorization it relied on (such as an existing guardian relationship) is revoked by another change in the moment between the authorization check and the write; the edit is now left for lead review instead.
+
 ## 2026-11-23
 
 ### Added

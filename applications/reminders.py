@@ -38,7 +38,7 @@ from .services import (
 logger = logging.getLogger(__name__)
 
 INACTIVITY_DELAY = timedelta(hours=48)
-DEADLINE_WINDOW = timedelta(days=2)
+DEADLINE_WINDOW = timedelta(days=3)
 MAX_BATCH_SIZE = 1000
 
 _DRAFT_STATUSES = (
