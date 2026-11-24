@@ -27,7 +27,9 @@ class RequiresAtomicBlockTests(TransactionTestCase):
     calling the helper without an explicit transaction must fail fast."""
 
     def test_requires_an_outer_atomic_block(self):
-        org = Organization.objects.get(slug="gos")
+        org = Organization.objects.create(
+            name="Atomic Test Org", slug="atomic-test-org"
+        )
         with self.assertRaises(RuntimeError):
             claim_profile_emails(org, ["pat@example.com"])
 
